@@ -125,6 +125,58 @@ other row.
 | 3   | Short summary.           | Also short.           |
 ```
 
+### Example 4: A table lifted out of a larger document
+
+The README blocks do not have to be whole files. This side of the example comes from
+one *region* of `fixtures/example-4/source.md` — the lines between `<!-- #region table -->`
+and `<!-- #endregion -->` — so the file can carry prose that the README does not need to
+repeat. The directive lines are never injected, and the rest of the file is untouched.
+
+[fixtures/example-4/source.md](./fixtures/example-4/source.md#region:table)
+
+```markdown
+| When | What | Who |
+| --- | --- | --- |
+| Mon | Cut the release branch | Ada |
+| Tue | Announce it | Grace |
+```
+
+[fixtures/example-4/after.md](./fixtures/example-4/after.md)
+
+```markdown
+| When | What                   | Who   |
+| ---- | ---------------------- | ----- |
+| Mon  | Cut the release branch | Ada   |
+| Tue  | Announce it            | Grace |
+```
+
+### Example 5: Alignment markers are kept
+
+The separator row also says how each column is aligned (`:---` left, `---:` right,
+`:---:` centre), and that hint is preserved: the colon is written back into the
+regenerated cell and the dashes give it room, so the cell is still exactly as wide as
+the column it heads. `Qty` below is right-aligned and `Price` centred; `Item` and
+`Notes` carry no marker. The cells themselves are still padded on the right — it is the
+renderer that applies the alignment when the table is displayed.
+
+[fixtures/example-5/before.md](./fixtures/example-5/before.md)
+
+```markdown
+| Item | Qty | Price | Notes |
+| :--- | ---: | :---: | --- |
+| Widget | 12 | 4.50 | In stock |
+| Gadget | 3 | 12.00 | Back-ordered |
+```
+
+[fixtures/example-5/after.md](./fixtures/example-5/after.md)
+
+```markdown
+| Item   | Qty  | Price | Notes        |
+| :----- | ---: | :---: | ------------ |
+| Widget | 12   | 4.50  | In stock     |
+| Gadget | 3    | 12.00 | Back-ordered |
+```
+
 ---
 
 ### Verify alignment
@@ -155,6 +207,11 @@ that column out to a silly width.
 * if *every* cell in the column is >= 100, fall back to the longest cell, capped at 100
 * floor of 3, so the separator is always a legal Markdown separator (`---`)
 
+The separator row is measured like any other row even though it is rebuilt: that is
+what keeps the rebuilt cell exactly as wide as the one it replaces. An aligning colon
+is a real character, so a `:---:` cell measures five and the column under it takes
+that width.
+
 ### Rule 2 — padding never crosses a column boundary
 
 Cells are **not** simply padded to the column width. Every row is written with a
@@ -180,7 +237,7 @@ For a table with `n` columns:
 **1. Measure**
 
 ```
-W[i] = max length of cells in column i whose length < 100      (separator row excluded)
+W[i] = max length of cells in column i whose length < 100
 W[i] = min(longest cell, 100)      if no cell in column i was under 100
 W[i] = max(W[i], 3)
 ```
@@ -209,8 +266,24 @@ for i in 0..n-1:
 `idealEnd[i] - pos` is the whole column width on an unshifted row (normal
 padding), less than it when the row has been pushed right (padding shrinks), and
 negative once the push has passed the boundary (`max` keeps the raw content, zero
-padding). The separator row is written as `W[i]` dashes, so every pipe in it lands
-on the same indexes as the rows around it.
+padding).
+
+**4. Rebuild the separator row**
+
+```
+for i in 0..n-1:
+    write dashes filling W[i], with the colon of A[i] (left, right, centre) kept
+```
+
+`A[i]` is the alignment row 2 declared: none, `:`… (left), …`:` (right) or `:`…`:`
+(centre). The colon sits inside the `W[i]` characters rather than beside them, so
+every pipe still lands on the same indexes as the rows around it.
+
+`A` comes from the separator row itself, so the two feed each other: that row is
+measured in step 1 as the text it is, colons and all, which is what makes the cell
+rebuilt in step 4 exactly as wide as the one it replaces. At the 3-character floor
+there is only room for the colon plus two dashes, so a column that narrow gets
+`:--` or `--:` — legal GFM, and it stays that way on the next run.
 
 ---
 
@@ -220,7 +293,9 @@ on the same indexes as the rows around it.
 
 * Re-pads every cell and re-emits the row as `| … | … |`, so a missing leading or
   trailing outer pipe is added.
-* Regenerates row 2 as the separator row, as plain dashes of the measured width.
+* Regenerates row 2 as the separator row, at the measured width of each column.
+* Keeps the alignment row 2 declared: a `:---` cell is rebuilt as `:` plus dashes
+  filling the column, a `:---:` one keeps both colons.
 * Rows with fewer cells than the widest row get empty cells appended.
 
 **Leaves alone**
@@ -244,9 +319,10 @@ on the same indexes as the rows around it.
 
 ## Behaviour to be aware of
 
-* **Alignment colons are lost.** `| :--- | ---: |` is regenerated as `| --- | --- |`,
-  so left/right/centre alignment markers are not preserved. Add them back by hand
-  if the table relies on them.
+* **Alignment is kept, not re-decided.** The separator row comes back as the
+  alignment it declared — `:---` left, `---:` right, `:---:` centre — with the colon
+  written back inside the measured width. A column with no marker gains none, and a
+  column too narrow for a third dash gets the two it can hold (`:--`, `--:`).
 * **Cells are trimmed.** Intentional leading/trailing spaces inside a cell are
   removed before measuring.
 * **Row 2 is the separator row** (standard GFM) when every one of its cells matches
@@ -280,11 +356,17 @@ tool output and those README bytes, so the two can never disagree.
 ### Markers and regions
 
 A marker is a line that is nothing but a link to a real path, labelled with that
-same path. The fenced block under it is that file's content, byte for byte. Name a
-region in the fragment to inject only part of a file:
+same path. The fenced block under it is that file's content, byte for byte. Add a
+region to the fragment to inject only part of a file:
 
-    [fixtures/example-1/before.md](./fixtures/example-1/before.md)               whole file
-    [fixtures/example-4/source.md](./fixtures/example-4/source.md#region:table)   one region
+| line                                     | injects                |
+| ---------------------------------------- | ---------------------- |
+| `[path/to/notes.md](./path/to/notes.md)` | the whole file         |
+| `[…]` with a `#region:demo` fragment     | just that region of it |
+
+The examples above are spelled inside inline code on purpose: a line that *is* the
+link, with nothing around it, is a live marker for the injector, and every one of
+those must name a real file (as the ten under the examples do).
 
 A region runs from `#region <name>` to the matching `#endregion`, and the directive
 lines are never injected. The directive is accepted under any language's comment

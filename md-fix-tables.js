@@ -45,18 +45,54 @@ function isSeparatorRow(row, rowIndex) {
   return rowIndex === 1 && row.length > 0 && row.every(c => SEP_CELL.test(c));
 }
 
+// Which way a separator cell points its column: `| :--- |` left, `| ---: |`
+// right, `| :---: |` centre, `| --- |` unchanged.
+function alignmentOf(cell) {
+  const left = cell.startsWith(':');
+  const right = cell.endsWith(':');
+  if (left && right) return 'center';
+  if (left) return 'left';
+  if (right) return 'right';
+  return 'none';
+}
+
+// Rebuild one separator cell at the column's width, keeping any alignment
+// markers. A colon occupies a character of the cell, so the dashes give it room
+// — the cell spans the column width, except for the narrowest aligned column
+// (width 3), where keeping two dashes costs it one character too many.
+function separatorCell(alignment, width) {
+  if (alignment === 'none') return '-'.repeat(width);
+  if (alignment === 'center') return `:${'-'.repeat(Math.max(width - 2, 2))}:`;
+  if (alignment === 'left') return `:${'-'.repeat(Math.max(width - 1, 2))}`;
+  return `${'-'.repeat(Math.max(width - 1, 2))}:`; // right
+}
+
+// Align a table block. Row 2's separator cells are regenerated at each measured
+// column width, keeping whatever alignment (`:---`, `---:`, `:---:`) they
+// declared; the colons stay inside the cell, so every pipe still lands on the
+// same index as the rows around it.
 function alignTable(rows, maxCol) {
   const tableData = rows.map(parseRow);
   const numCols = Math.max(...tableData.map(r => r.length));
 
+  // The alignment row, for the columns it covers. A block whose row 2 is not a
+  // separator row has no alignment to keep.
+  const separator = isSeparatorRow(tableData[1] ?? [], 1) ? tableData[1] : null;
+  const alignments = Array.from({ length: numCols }, (_, i) =>
+    separator ? alignmentOf(separator[i] ?? '') : 'none');
+
   // Rule 1: a column's width is the longest content that is still under maxCol.
   // A cell at/over maxCol is ignored while measuring, so one huge cell cannot
   // widen the column and force every shorter cell to pad out to it.
+  //
+  // Row 2 is measured along with every other row even though it is regenerated:
+  // its colons are the only content that takes up room without being text, and
+  // counting the whole cell is what makes the rebuilt separator exactly as wide
+  // as the one it replaces.
   const colWidths = Array(numCols).fill(0);
   const longestCell = Array(numCols).fill(0);
 
-  tableData.forEach((row, rowIndex) => {
-    if (isSeparatorRow(row, rowIndex)) return; // regenerated, never measured
+  tableData.forEach(row => {
     row.forEach((cell, i) => {
       if (cell.length > longestCell[i]) longestCell[i] = cell.length;
       if (cell.length < maxCol && cell.length > colWidths[i]) {
@@ -88,7 +124,7 @@ function alignTable(rows, maxCol) {
   // never carries this row further into the next column's space.
   return tableData.map((row, rowIndex) => {
     if (isSeparatorRow(row, rowIndex)) {
-      return `| ${colWidths.map(w => '-'.repeat(w)).join(' | ')} |`;
+      return `| ${colWidths.map((w, i) => separatorCell(alignments[i], w)).join(' | ')} |`;
     }
 
     const cells = [];

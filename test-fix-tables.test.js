@@ -204,12 +204,78 @@ describe('fixTables', () => {
         for (const width of widths) expect(width).toBeGreaterThanOrEqual(MIN_COL);
     });
 
-    test('alignment colons are dropped', () => {
+    test('alignment colons are preserved', () => {
         const before = ['| A | B |', '| :--- | ---: |', '| 1 | 2 |'].join('\n');
+        const after = fixTables(before).split('\n');
+
+        // Left and right alignment keep their colon on its own side, and the
+        // separator cell stays the same width as the column it heads.
+        expect(after[1]).toBe('| :--- | ---: |');
+        expect(after[0]).toBe('| A    | B    |');
+        for (const line of after) expect(pipes(line)).toEqual([0, 7, 14]);
+    });
+
+    test('every alignment survives: left, right, centre and plain', () => {
+        const before = [
+            '| Left | Right | Centre | Plain |',
+            '| :--- | ---: | :---: | --- |',
+            '| 1 | 2 | 3 | 4 |',
+        ].join('\n');
+        const after = fixTables(before).split('\n');
+
+        expect(after[1]).toBe('| :--- | ----: | :----: | ----- |');
+        for (const line of after) expect(pipes(line)).toEqual([0, 7, 15, 24, 32]);
+    });
+
+    test('a separator wider than the content keeps its columns aligned', () => {
+        const before = ['| A | B |', '| :--- | :---: |', '| 1 | 2 |'].join('\n');
+        const after = fixTables(before).split('\n');
+
+        // The `:---:` cell is five characters wide, so its column measures five
+        // even though the text above it is one character.
+        expect(after).toEqual([
+            '| A    | B     |',
+            '| :--- | :---: |',
+            '| 1    | 2     |',
+        ]);
+        for (const line of after) expect(pipes(line)).toEqual([0, 7, 15]);
+    });
+
+    test('a narrow aligned column keeps two dashes beside its colon', () => {
+        const before = ['| A | B |', '| :--- | ---: |'].join('\n');
         const after = fixTables(before);
 
-        expect(after).not.toContain(':');
-        expect(after.split('\n')[1]).toBe('| --- | --- |');
+        // Both cells carry one character. The `:---` cell is four wide, so the
+        // column measures four — and the rebuilt cell is `:` plus three dashes,
+        // never the illegal-in-spirit `:-` that would fit a bare 3-wide column.
+        expect(after).toBe([
+            '| A    | B    |',
+            '| :--- | ---: |',
+        ].join('\n'));
+        expect(fixTables(after)).toBe(after);
+    });
+
+    test('a 3-wide column keeps a legal colon form', () => {
+        // Already at the floor: one character of content and a two-dash
+        // separator, so there is no room for a third dash.
+        const before = ['| A |', '| :-- |'].join('\n');
+        expect(fixTables(before)).toBe('| A   |\n| :-- |');
+    });
+
+    test('a table with no alignment markers gains none', () => {
+        const before = ['| A | B |', '| --- | --- |', '| 1 | 2 |'].join('\n');
+        expect(fixTables(before)).not.toContain(':');
+    });
+
+    test('preserved alignment is idempotent', () => {
+        const before = [
+            '| Left | Right | Centre | Plain |',
+            '| :--- | ---: | :---: | --- |',
+            '| 1 | 2 | 3 | 4 |',
+        ].join('\n');
+
+        const once = fixTables(before);
+        expect(fixTables(once)).toBe(once);
     });
 
     test('an escaped pipe does not split its cell', () => {

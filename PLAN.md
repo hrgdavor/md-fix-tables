@@ -30,6 +30,12 @@ telling a different story than the code.
   tool's default stays 100, so no example line exceeds 72 columns and the tables do
   not wrap in a preview. Tests pin that width, and pin the pipe indexes the prose
   quotes, so the numbers in the docs cannot go stale quietly.
+* **Alignment colons are preserved.** `| :--- | ---: | :---: |` comes back as the
+  alignment it declared: the separator cell is rebuilt at the measured column width
+  with its colon written back inside it, so left/right/centre survive and the pipes
+  still line up. The separator row is measured like any other row, which is what
+  makes a rebuilt separator exactly as wide as the cell it replaces. A column at the
+  3-character floor gets `:--` rather than a one-dash `:-`.
 
 ## Next
 
@@ -40,9 +46,10 @@ telling a different story than the code.
 2. **Skip indented code blocks.** A pipe line indented by four spaces or a tab is a
    Markdown code block; it is currently de-indented and re-padded. Require the `|`
    at column 0, or make tolerance an explicit opt-in.
-3. **Preserve alignment colons.** `| :--- | ---: |` comes back as `| --- | --- |`,
-   silently dropping left/right/centre alignment. Keep the colons and rebuild the
-   separator cell as `:` + dashes (+ `:`) at the measured width.
+3. **Alignment when there is no separator row.** A block whose row 2 is not a
+   separator row has no alignment to keep, and it is realigned without any separator
+   being generated. That is the same question as item 6 (`--strict` vs
+   `--add-separator`), so settle it there rather than here.
 4. **Preserve line endings.** Table rows are re-emitted LF-only, so a CRLF file ends
    up with mixed endings. Split with the terminator retained (or detect the dominant
    EOL) and re-emit the same one.
