@@ -2,11 +2,13 @@
   "name": "md-fix-tables",
   "version": "1.0.0",
   "description": "A small utility to fix tables in markdown files",
-  "main": "index.js",
+  "main": "md-fix-tables.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "test": "bun test-fix-tables.js"
+    "start": "node md-fix-tables.js",
+    "test": "bun test",
+    "inject:examples": "node tools/inject-examples.mjs",
+    "check:examples": "node tools/inject-examples.mjs --check"
   },
   "keywords": ["markdown", "tables", "fix"],
   "author": "",

@@ -1,31 +1,56 @@
 import { readFileSync, writeFileSync } from 'fs';
+import { pathToFileURL } from 'url';
 
 // A cell at/over MAX_COL never sets a column width and is never padded.
-const MAX_COL = 100;
-const MIN_COL = 3; // smallest legal markdown separator
+export const MAX_COL = 100;
+export const MIN_COL = 3; // smallest legal markdown separator
 
-const SEP_CELL = /^:?-{3,}:?$/;
+export const SEP_CELL = /^:?-{3,}:?$/;
 
+// A line is part of a table when its first non-space character is a pipe.
+function isTableLine(line) {
+  return line.trim().startsWith('|');
+}
+
+// Split a row into trimmed cells. `\|` is an escaped pipe: it stays literal and
+// does not split the cell. A leading/trailing empty cell is the row's outer pipe.
 function parseRow(row) {
-  return row.split('|')
-    .map(cell => cell.trim())
-    .filter((cell, index, arr) => {
-      if (index === 0 && cell === "") return false;
-      if (index === arr.length - 1 && cell === "") return false;
-      return true;
-    });
+  const raw = [];
+  let cell = '';
+  let escaped = false;
+
+  for (const ch of row) {
+    if (escaped) {
+      cell += ch;
+      escaped = false;
+    } else if (ch === '\\') {
+      cell += ch;
+      escaped = true;
+    } else if (ch === '|') {
+      raw.push(cell);
+      cell = '';
+    } else {
+      cell += ch;
+    }
+  }
+  raw.push(cell);
+
+  const cells = raw.map(c => c.trim());
+  if (cells.length > 0 && cells[0] === '') cells.shift();
+  if (cells.length > 0 && cells[cells.length - 1] === '') cells.pop();
+  return cells;
 }
 
 function isSeparatorRow(row, rowIndex) {
   return rowIndex === 1 && row.length > 0 && row.every(c => SEP_CELL.test(c));
 }
 
-function alignTable(rows) {
+function alignTable(rows, maxCol) {
   const tableData = rows.map(parseRow);
   const numCols = Math.max(...tableData.map(r => r.length));
 
-  // Rule 1: a column's width is the longest content that is still under MAX_COL.
-  // A cell at/over MAX_COL is ignored while measuring, so one huge cell cannot
+  // Rule 1: a column's width is the longest content that is still under maxCol.
+  // A cell at/over maxCol is ignored while measuring, so one huge cell cannot
   // widen the column and force every shorter cell to pad out to it.
   const colWidths = Array(numCols).fill(0);
   const longestCell = Array(numCols).fill(0);
@@ -34,15 +59,15 @@ function alignTable(rows) {
     if (isSeparatorRow(row, rowIndex)) return; // regenerated, never measured
     row.forEach((cell, i) => {
       if (cell.length > longestCell[i]) longestCell[i] = cell.length;
-      if (cell.length < MAX_COL && cell.length > colWidths[i]) {
+      if (cell.length < maxCol && cell.length > colWidths[i]) {
         colWidths[i] = cell.length;
       }
     });
   });
 
   for (let i = 0; i < numCols; i++) {
-    // Every cell in this column was >= MAX_COL: fall back to the widest, capped.
-    if (colWidths[i] === 0) colWidths[i] = Math.min(longestCell[i], MAX_COL);
+    // Every cell in this column was >= maxCol: fall back to the widest, capped.
+    if (colWidths[i] === 0) colWidths[i] = Math.min(longestCell[i], maxCol);
     if (colWidths[i] < MIN_COL) colWidths[i] = MIN_COL;
   }
 
@@ -78,36 +103,96 @@ function alignTable(rows) {
   }).join('\n');
 }
 
-function processContent(content) {
+/**
+ * Re-align every pipe table in markdown text.
+ *
+ * `maxCol` is the width at/above which a cell stops counting towards its
+ * column's width (default MAX_COL, 100).
+ */
+export function fixTables(content, maxCol = MAX_COL) {
   const lines = content.split('\n');
   let result = [], currentTable = [];
 
   for (const line of lines) {
-    if (line.trim().startsWith('|')) {
+    if (isTableLine(line)) {
       currentTable.push(line);
     } else {
       if (currentTable.length > 0) {
-        result.push(alignTable(currentTable));
+        result.push(alignTable(currentTable, maxCol));
         currentTable = [];
       }
       result.push(line);
     }
   }
-  if (currentTable.length > 0) result.push(alignTable(currentTable));
+  if (currentTable.length > 0) result.push(alignTable(currentTable, maxCol));
   return result.join('\n');
 }
 
-const filePath = process.argv[2];
-if (filePath) {
-  try {
-    const content = readFileSync(filePath, 'utf-8');
-    writeFileSync(filePath, processContent(content));
-  } catch (err) {
-    process.stderr.write(`Error: ${err.message}\n`);
-    process.exit(1);
+/**
+ * Parse the command line. Accepts a single file path plus an optional width:
+ *
+ *   --max-col=<n>   --max-col <n>   -m <n>   -m=<n>
+ */
+export function parseArgs(argv) {
+  let maxCol = MAX_COL;
+  let filePath = null;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    let value = null;
+
+    if (arg.startsWith('--max-col=')) {
+      value = arg.slice('--max-col='.length);
+    } else if (arg === '--max-col' || arg === '-m') {
+      value = argv[++i];
+    } else if (arg.startsWith('-m=')) {
+      value = arg.slice('-m='.length);
+    } else if (!arg.startsWith('-')) {
+      filePath = arg;
+      continue;
+    } else {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed < MIN_COL) {
+      throw new Error(`--max-col needs an integer >= ${MIN_COL}, got: ${value}`);
+    }
+    maxCol = parsed;
   }
-} else {
-  let input = '';
-  process.stdin.on('data', d => input += d);
-  process.stdin.on('end', () => process.stdout.write(processContent(input)));
+
+  return { filePath, maxCol };
+}
+
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+function reportError(err) {
+  process.stderr.write(`Error: ${err.message}\n`);
+  process.exitCode = 1;
+}
+
+// `import.meta.main` is Bun-only; under node, compare argv[1] with this file.
+function isMain() {
+  if (typeof import.meta.main === 'boolean') return import.meta.main;
+  return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+}
+
+if (isMain()) {
+  try {
+    const { filePath, maxCol } = parseArgs(process.argv.slice(2));
+    if (filePath) {
+      // File mode: rewrite in place and print nothing.
+      const content = readFileSync(filePath, 'utf-8');
+      writeFileSync(filePath, fixTables(content, maxCol));
+    } else {
+      // Stdin mode: read stdin and write the aligned result to stdout.
+      process.stdout.write(fixTables(await readStdin(), maxCol));
+    }
+  } catch (err) {
+    reportError(err);
+  }
 }

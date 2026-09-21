@@ -1,20 +1,24 @@
 @echo off
-REM Wrapper script to run md-fix-tables under bun or node
+REM Wrapper so the aligner can be run from cmd.exe: runs it under bun if bun is
+REM on PATH, otherwise under node. All arguments are forwarded untouched.
 setlocal enabledelayedexpansion
 
 if "%~1"=="" (
-    echo Usage: md-fix-tables.bat <file.md>
+    echo Usage: md-fix-tables.bat ^<file.md^> [--max-col=N] 1>&2
     exit /b 1
 )
 
-REM Try bun first, fall back to node
-if exist "bun.exe" (
-    bun "%~dp0index.js" %*
-) else if exist "node.exe" (
-    node "%~dp0index.js" %*
-) else (
-    echo Error: Please install bun or node
-    exit /b 1
+where bun >nul 2>nul
+if !errorlevel! equ 0 (
+    bun "%~dp0md-fix-tables.js" %*
+    exit /b !errorlevel!
 )
 
-exit /b !errorlevel!
+where node >nul 2>nul
+if !errorlevel! equ 0 (
+    node "%~dp0md-fix-tables.js" %*
+    exit /b !errorlevel!
+)
+
+echo Error: neither bun nor node was found on PATH 1>&2
+exit /b 1

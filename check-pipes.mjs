@@ -1,99 +1,119 @@
 #!/usr/bin/env node
 
 /**
- * check-pipes — Verify table delimiter alignment in a markdown file.
- * 
- * Prints the character index of each `|` delimiter for lines containing tables,
- * allowing you to confirm that columns are properly aligned.
+ * check-pipes — show where the pipes in a table land, so alignment can be
+ * verified instead of eyeballed.
+ *
+ *   node check-pipes.mjs <file.md> [--anchor "| Name"] [--lines 13]
+ *
+ * Prints the character index of every pipe in the table block, then summarises
+ * which indexes are shared by every row. An index that only one row deviates on
+ * is an overrun: a cell whose content is longer than its column, which no amount
+ * of padding can fix without truncating the text.
  */
 
 import { readFileSync } from 'fs';
 
-const DEFAULT_ANCHOR = '| Part';
-const DEFAULT_LINES = 13;
+const DEFAULT_LINES = 0; // 0 = whole block
 
-/**
- * Find all lines starting with | in a file and print their delimiter positions.
- */
-function checkPipes(filePath, anchor = DEFAULT_ANCHOR, linesToPrint = DEFAULT_LINES) {
-    try {
-        const content = readFileSync(filePath, 'utf8');
-        const lines = content.split('\n');
-        
-        // Find the line containing the anchor string
-        let anchorIdx = -1;
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes(anchor)) {
-                anchorIdx = i;
-                break;
-            }
-        }
-        
-        // If anchor not found, start from beginning
-        if (anchorIdx === -1) {
-            console.error(`Anchor string "${anchor}" not found in file.`);
-            process.exit(1);
-        }
-        
-        // Print delimiter positions for lines around the anchor
-        const start = Math.max(0, anchorIdx - Math.floor(linesToPrint / 2));
-        const end = Math.min(lines.length, anchorIdx + Math.ceil(linesToPrint / 2) + 1);
-        
-        console.log(`File: ${filePath}`);
-        console.log(`Anchor: "${anchor}" at line ${anchorIdx + 1}`);
-        console.log(`Printing lines ${start + 1} to ${end}:`);
-        console.log('');
-        
-        for (let i = start; i < end; i++) {
-            const line = lines[i];
-            
-            // Skip non-table lines
-            if (!line.startsWith('|')) continue;
-            
-            // Extract delimiter positions
-            const delimiters = [];
-            let pos = 0;
-            
-            while ((pos = line.indexOf('|', pos)) !== -1) {
-                delimiters.push(pos);
-                pos++;
-            }
-            
-            if (delimiters.length > 0) {
-                console.log(`Line ${i + 1}: "${line.substring(0, Math.min(80, line.length))}..."`);
-                console.log(`         Delimiter positions: [${delimiters.join(', ')}]`);
-                
-                // Check if delimiters are aligned (same position across rows)
-                if (delimiters.length >= 2) {
-                    const firstDelim = delimiters[0];
-                    const secondDelim = delimiters[1];
-                    
-                    if (firstDelim === secondDelim) {
-                        console.log(`         Status: ✓ Aligned`);
-                    } else {
-                        console.log(`         Status: ✗ Misaligned (diff: ${secondDelim - firstDelim})`);
-                    }
-                }
-                
-                console.log('');
-            }
-        }
-        
-    } catch (err) {
-        console.error(err.message);
-        process.exit(1);
-    }
+function usage() {
+  console.error('Usage: node check-pipes.mjs <file.md> [--anchor "<text>"] [--lines <n>]');
 }
 
-// Run as script when executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-    const args = process.argv.slice(2);
-    
-    if (args.length >= 1) {
-        checkPipes(args[0], args[1] || DEFAULT_ANCHOR, args[2] ? parseInt(args[2]) : DEFAULT_LINES);
+/** Character indexes of the unescaped pipes in a line. */
+function pipeIndexes(line) {
+  const indexes = [];
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '\\') { i++; continue; }
+    if (line[i] === '|') indexes.push(i);
+  }
+  return indexes;
+}
+
+const isTableLine = (line) => line.trim().startsWith('|');
+
+/** Contiguous table block containing `anchorIndex` (or the first one). */
+function findBlock(lines, anchorIndex) {
+  if (anchorIndex === -1) {
+    const first = lines.findIndex(isTableLine);
+    if (first === -1) return null;
+    anchorIndex = first;
+  }
+
+  let start = anchorIndex;
+  while (start > 0 && isTableLine(lines[start - 1])) start--;
+  let end = anchorIndex;
+  while (end + 1 < lines.length && isTableLine(lines[end + 1])) end++;
+
+  return { start, end };
+}
+
+function main(argv) {
+  const filePath = argv.find((arg) => !arg.startsWith('--')) ?? null;
+  const anchorIndex = argv.indexOf('--anchor');
+  const anchor = anchorIndex === -1 ? null : argv[anchorIndex + 1];
+  const linesIndex = argv.indexOf('--lines');
+  const maxLines = linesIndex === -1 ? DEFAULT_LINES : Number.parseInt(argv[linesIndex + 1], 10);
+
+  if (!filePath) {
+    usage();
+    return 1;
+  }
+
+  const lines = readFileSync(filePath, 'utf-8').split('\n');
+  const anchorAt = anchor ? lines.findIndex((line) => line.includes(anchor)) : -1;
+
+  if (anchor && anchorAt === -1) {
+    console.error(`Anchor not found: ${anchor}`);
+    return 1;
+  }
+
+  const block = findBlock(lines, anchorAt);
+  if (!block) {
+    console.error('No table found (a table line is one whose first non-space character is "|").');
+    return 1;
+  }
+
+  let rows = [];
+  for (let i = block.start; i <= block.end; i++) rows.push({ line: lines[i], indexes: pipeIndexes(lines[i]) });
+  if (Number.isInteger(maxLines) && maxLines > 0) rows = rows.slice(0, maxLines);
+
+  console.log(`${filePath}: table on lines ${block.start + 1}-${block.end + 1}\n`);
+
+  for (const [offset, row] of rows.entries()) {
+    const shown = row.line.length > 70 ? `${row.line.slice(0, 70)}…` : row.line;
+    console.log(`line ${String(block.start + offset + 1).padStart(4)}  ${shown}`);
+    console.log(`            pipes at ${row.indexes.join(', ') || '(none)'}`);
+  }
+
+  // Summarise per pipe position: which indexes appear, and on how many rows.
+  const positions = Math.max(...rows.map((row) => row.indexes.length));
+  const summary = [];
+  for (let p = 0; p < positions; p++) {
+    const counts = new Map();
+    for (const row of rows) {
+      const value = row.indexes[p];
+      if (value === undefined) continue;
+      counts.set(value, (counts.get(value) ?? 0) + 1);
+    }
+    const entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    summary.push({ position: p + 1, entries });
+  }
+
+  console.log('');
+  let aligned = true;
+  for (const { position, entries } of summary) {
+    if (entries.length === 1) {
+      console.log(`pipe ${position}: aligned at ${entries[0][0]} on all ${entries[0][1]} rows`);
     } else {
-        console.log('Usage: node check-pipes.mjs <file.md> [anchor] [lines]');
-        console.log(`Example: node check-pipes.mjs codebuddy.md "| Part" 13`);
-        process.exit(0);
+      aligned = false;
+      const detail = entries.map(([index, count]) => `${index} (${count} row${count === 1 ? '' : 's'})`).join(', ');
+      console.log(`pipe ${position}: NOT aligned — ${detail}`);
     }
+  }
+  console.log(aligned ? '\nEvery pipe is aligned.' : '\nSome pipes are not aligned (see above).');
+
+  return 0;
 }
+
+process.exitCode = main(process.argv.slice(2));
