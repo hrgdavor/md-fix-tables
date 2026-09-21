@@ -186,10 +186,10 @@ md-fix-tables.bat input.md
 
 ### Configurable max column width
 
-By default, cells with 100 or more characters don't affect column width. You can change this:
+By default, cells with **100 or more characters** don't affect column width measurement. This limit can be overridden:
 
 ```bash
-# Use a smaller threshold (50 chars)
+# Use a smaller threshold (50 chars) - overrides the 100 char default
 bun md-fix-tables.js --max-col=50 input.md
 
 # Or use a larger threshold (200 chars)  
