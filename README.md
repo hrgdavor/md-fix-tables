@@ -385,6 +385,47 @@ a file, and an unterminated region is an error rather than a silent no-op.
 
 ---
 
+## The Zig port
+
+`build.zig`, `build.zig.zon` and `src/` hold a second implementation of this
+exact tool in Zig, written against Zig 0.16.0 (this checkout used the toolchain
+at `D:\wrk\zig\16\zig.exe`). It is not a rewrite-with-ideas: its job is to
+produce the same bytes the JavaScript one produces, in every mode, on every
+input.
+
+```bash
+zig build                     # → zig-out/bin/md-fix-tables(.exe)
+zig build test                # the ported test suite (fixtures included)
+node tools/compare-zig.mjs    # differential harness: JS vs Zig, byte by byte
+```
+
+The binary is a drop-in stand-in for `bun md-fix-tables.js`: same flags
+(`--max-col` in all four spellings), same stdin/stdout and rewrite-in-place
+modes, same `Error: …` messages on stderr and exit code 1 on failure.
+
+Four JavaScript details decide byte equality, so the Zig code mirrors them
+exactly instead of approximating:
+
+| JS behaviour                              | how the Zig port mirrors it                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------ |
+| `String.length` counts UTF-16 code units  | every width and padding count is a UTF-16 count, so an emoji pads one space    |
+| `String.trim`'s whitespace set            | the same NBSP/BOM/ogham/… set is trimmed, which is what makes `\u00a0\|` a row |
+| `Number.parseInt(x, 10)`                  | leading whitespace, one sign and trailing junk are all tolerated                |
+| `readFileSync(path, 'utf-8')` decoding    | the WHATWG utf-8 decoder: each invalid maximal subpart becomes one U+FFFD      |
+
+The library side is importable as well: `fixTables`, `parseArgs`, `decodeUtf8`
+and the constants live in `src/root.zig`, exposed as the `md_fix_tables`
+module of the package.
+
+`tools/compare-zig.mjs` is the proof. It runs both tools over every file in
+the repository, a battery of edge cases (CRLF, BOM, astral-plane cells,
+invalid UTF-8, every argument spelling, missing files, directories), and two
+seeded fuzzers — table-shaped input and raw random bytes — and compares
+stdout, stderr, exit code and in-place rewrites byte for byte. `--seed N` and
+`--rounds N` vary the corpus.
+
+---
+
 ## Constants
 
 | Constant   | Value           | Meaning                                                      |
