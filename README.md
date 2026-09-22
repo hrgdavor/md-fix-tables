@@ -394,7 +394,7 @@ produce the same bytes the JavaScript one produces, in every mode, on every
 input.
 
 ```bash
-zig build                     # → zig-out/bin/md-fix-tables(.exe)
+zig build                     # → zig-out/md-fix-tables(.exe)
 zig build test                # the ported test suite (fixtures included)
 node tools/compare-zig.mjs    # differential harness: JS vs Zig, byte by byte
 ```
@@ -402,6 +402,11 @@ node tools/compare-zig.mjs    # differential harness: JS vs Zig, byte by byte
 The binary is a drop-in stand-in for `bun md-fix-tables.js`: same flags
 (`--max-col` in all four spellings), same stdin/stdout and rewrite-in-place
 modes, same `Error: …` messages on stderr and exit code 1 on failure.
+
+Tagging `v*` runs `.github/workflows/release.yml` (adapted from
+zig-watch-scp), which cross-builds `ReleaseSafe` binaries for x86_64 Linux,
+Windows and macOS (x86_64 and aarch64) and attaches them to a GitHub
+release.
 
 Four JavaScript details decide byte equality, so the Zig code mirrors them
 exactly instead of approximating:

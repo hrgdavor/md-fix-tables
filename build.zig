@@ -24,7 +24,13 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(exe);
+    // `.dest_dir = .{ .override = .prefix }` installs the binary directly into
+    // zig-out/ instead of zig-out/bin/. The release workflow's packaging paths
+    // must stay in step with this (see .github/workflows/release.yml).
+    const install_exe = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .prefix },
+    });
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_step = b.step("run", "Run the aligner");
     const run_cmd = b.addRunArtifact(exe);

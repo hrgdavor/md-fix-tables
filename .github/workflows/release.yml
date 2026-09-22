@@ -1,0 +1,92 @@
+name: Release Builds
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            artifact_name: md-fix-tables
+            archive_name: md-fix-tables-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-windows
+            artifact_name: md-fix-tables.exe
+            archive_name: md-fix-tables-windows-x86_64.zip
+          - os: macos-latest
+            target: x86_64-macos
+            artifact_name: md-fix-tables
+            archive_name: md-fix-tables-macos-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-macos
+            artifact_name: md-fix-tables
+            archive_name: md-fix-tables-macos-aarch64.tar.gz
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Set macOS SDK root
+        if: runner.os == 'macOS'
+        run: echo "ZIG_SYSROOT=--sysroot $(xcrun --show-sdk-path)" >> $GITHUB_ENV
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe ${{ env.ZIG_SYSROOT }} --summary all
+
+      # build.zig installs with dest_dir = .{ .override = .prefix }, so the
+      # binary lands directly in zig-out/ rather than zig-out/bin/.
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.archive_name }} -C zig-out ${{ matrix.artifact_name }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path zig-out\${{ matrix.artifact_name }} -DestinationPath ${{ matrix.archive_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: ${{ matrix.archive_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/md-fix-tables-linux-x86_64.tar.gz
+            artifacts/md-fix-tables-windows-x86_64.zip
+            artifacts/md-fix-tables-macos-x86_64.tar.gz
+            artifacts/md-fix-tables-macos-aarch64.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

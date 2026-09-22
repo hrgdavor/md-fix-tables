@@ -2,7 +2,7 @@
 
 /**
  * Differential harness: `node md-fix-tables.js` vs the Zig build
- * (`zig-out/bin/md-fix-tables[.exe]`).
+ * (`zig-out/md-fix-tables[.exe]`).
  *
  * Everything is compared byte for byte: stdout, stderr, exit code, and (in
  * file mode) the rewritten file. The corpus is the repo itself, a battery of
@@ -22,8 +22,8 @@ import { fileURLToPath } from 'node:url';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const JS_TOOL = join(ROOT, 'md-fix-tables.js');
 const ZIG_TOOL = process.platform === 'win32'
-    ? join(ROOT, 'zig-out', 'bin', 'md-fix-tables.exe')
-    : join(ROOT, 'zig-out', 'bin', 'md-fix-tables');
+    ? join(ROOT, 'zig-out', 'md-fix-tables.exe')
+    : join(ROOT, 'zig-out', 'md-fix-tables');
 
 if (!existsSync(ZIG_TOOL)) {
     console.error(`Zig binary not found: ${ZIG_TOOL}`);
