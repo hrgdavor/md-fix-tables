@@ -1,7 +1,6 @@
 # `md-fix-tables` — Markdown table aligner
 
 
-
 ### Basic usage
 
 ```bash
