@@ -8,9 +8,9 @@
  *     fixtures/example-1/after.md    byte-for-byte what fixTables(before) returns
  *
  * A `before.md` is deliberately ragged — do not run md-fix-tables.js over one.
- * tools/inject-examples.mjs copies both into README.md after the link that names
- * them, so the README cannot drift from them, and test-fix-tables.test.js fails
- * if the tool stops agreeing with any `after`.
+ * The inject-examples tool (see inject-examples/) copies both into README.md
+ * after the link that names them, so the README cannot drift from them, and
+ * test-fix-tables.test.js fails if the tool stops agreeing with any `after`.
  *
  * A side of an example can also come from one *region* of a larger file, so a
  * README block can show part of a document instead of the whole thing. Mark the
@@ -23,9 +23,21 @@
  * and name that region in the marker:
  *
  *     [fixtures/example-4/source.md](./fixtures/example-4/source.md#region:table)
+ *
+ * The marker and region grammar itself lives in the published tool, so the docs
+ * it generates and the tests that check them cannot disagree about it.
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
+import {
+    extractRegion,
+    findMarkers,
+    normalize,
+    parseMarker,
+    regionDirective,
+} from './inject-examples/index.mjs';
+
+export { extractRegion, findMarkers, parseMarker, regionDirective };
 
 const ROOT = new URL('.', import.meta.url);
 const WHICH = ['before', 'after'];
@@ -50,119 +62,6 @@ export const IDS = readdirSync(new URL('fixtures/', ROOT), { withFileTypes: true
 
 function readRepoFile(relativePath) {
     return readFileSync(new URL(relativePath, ROOT), 'utf8');
-}
-
-/** LF endings, and no trailing newline: exactly the text between README's fences. */
-function normalize(text) {
-    return text.replace(/\r\n/g, '\n').replace(/\n$/, '');
-}
-
-// ---------------------------------------------------------------------------
-// Regions
-// ---------------------------------------------------------------------------
-
-// `//`, `#`, `--`, `;`, `%`, `'`, REM, <!-- and /* ... */ are all comment
-// spellings seen in the wild; strip whichever one opens the line.
-const COMMENT_OPENER = /^(?:(?:\/\/|--|;|%|'|REM\b|<!--|\/\*|\*)\s*)+/i;
-const COMMENT_CLOSER = /\s*(?:-->|\*\/)$/;
-
-/**
- * Read one line as a region directive, or return null.
- * Returns `{ kind: 'region' | 'endregion', name }`.
- */
-export function regionDirective(line) {
-    let text = line.trim();
-
-    const closer = COMMENT_CLOSER.exec(text);
-    if (closer) text = text.slice(0, closer.index).trim();
-
-    const commented = COMMENT_OPENER.test(text);
-    if (commented) text = text.replace(COMMENT_OPENER, '').trim();
-
-    const match = /^(#?)(region|endregion)\b\s*(.*)$/i.exec(text);
-    if (!match) return null;
-    // A bare `region foo` line is prose, not a directive: without a comment
-    // prefix the C# spelling (`#region`) is required.
-    if (!commented && match[1] !== '#') return null;
-
-    return { kind: match[2].toLowerCase(), name: match[3].trim() };
-}
-
-/** The lines between `#region <name>` and the next `#endregion`, exclusive. */
-export function extractRegion(text, name) {
-    const lines = text.replace(/\r\n/g, '\n').split('\n');
-    const starts = [];
-    const ends = [];
-
-    lines.forEach((line, index) => {
-        const directive = regionDirective(line);
-        if (!directive) return;
-        if (directive.kind === 'region') {
-            if (directive.name === name) starts.push(index);
-        } else {
-            ends.push(index);
-        }
-    });
-
-    if (starts.length === 0) throw new Error(`no "#region ${name}" found`);
-    if (starts.length > 1) {
-        throw new Error(`"#region ${name}" appears ${starts.length} times; region names must be unique`);
-    }
-
-    const end = ends.find((index) => index > starts[0]);
-    if (end === undefined) throw new Error(`"#region ${name}" is never closed by an #endregion`);
-
-    return lines.slice(starts[0] + 1, end).join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Markers
-// ---------------------------------------------------------------------------
-
-const LINK = /^\[([^\]]+)\]\(([^)\s]+)\)$/;
-
-/**
- * Read one README line as an injection marker, or return null.
- *
- * A marker is a line that is nothing but a link to a real path, labelled with
- * that same path — optionally naming a region in the fragment:
- *
- *     [fixtures/example-1/before.md](./fixtures/example-1/before.md)
- *     [fixtures/example-4/source.md](./fixtures/example-4/source.md#region:table)
- *
- * Returns `{ raw, path, region }`.
- */
-export function parseMarker(line) {
-    const match = LINK.exec(line.trim());
-    if (!match) return null;
-
-    const [, label, destination] = match;
-    const hash = destination.indexOf('#');
-    const path = hash === -1 ? destination : destination.slice(0, hash);
-    const fragment = hash === -1 ? '' : destination.slice(hash + 1);
-
-    const withoutDotSlash = (value) => value.replace(/^\.\//, '');
-    if (withoutDotSlash(label) !== withoutDotSlash(path)) return null;
-
-    // Normalise away a leading `./` so `path` is directly usable as a path.
-    const relativePath = withoutDotSlash(path);
-
-    if (fragment === '') return { raw: line.trim(), path: relativePath, region: null };
-
-    // An unknown fragment means this is an ordinary link, not a marker.
-    const region = /^region:(.+)$/.exec(fragment);
-    if (!region) return null;
-    return { raw: line.trim(), path: relativePath, region: region[1] };
-}
-
-/** Every marker line in a document, in order. */
-export function findMarkers(lines) {
-    const markers = [];
-    for (const line of lines) {
-        const marker = parseMarker(line);
-        if (marker) markers.push(marker);
-    }
-    return markers;
 }
 
 /** The text a marker stands for: a whole file, or one region of one. */

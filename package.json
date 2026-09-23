@@ -4,6 +4,9 @@
   "description": "A small utility to fix tables in markdown files",
   "main": "md-fix-tables.js",
   "type": "module",
+  "dependencies": {
+    "@hrg/inject-examples": "^1.0.0"
+  },
   "scripts": {
     "start": "node md-fix-tables.js",
     "test": "bun test",
