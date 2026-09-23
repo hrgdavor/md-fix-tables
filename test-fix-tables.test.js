@@ -9,38 +9,79 @@
  *      following each `<!-- inject:<id>:before|after -->` marker.
  *
  * Run with `bun test`. Regenerate the README blocks with
- * `node tools/inject-examples.mjs`.
+ * `npm run inject:examples`, which runs the published `@hrg/inject-examples`
+ * through bunx (version pinned in package.json).
  */
 
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { fixTables, parseArgs, MAX_COL, MIN_COL } from './md-fix-tables.js';
-import {
-    EXAMPLE_MAX_COL,
-    EXAMPLES,
-    extractRegion,
-    findMarkers,
-    markerFor,
-    parseMarker,
-    regionDirective,
-    resolveMarker,
-} from './test-fixtures.js';
+import { EXAMPLE_MAX_COL, EXAMPLES, markerFor } from './test-fixtures.js';
 
 const README = readFileSync(new URL('./README.md', import.meta.url), 'utf8');
 
-/** The body of the fenced block that follows `marker` in README.md. */
-function readmeBlock(marker) {
-    const lines = README.split('\n');
-    const markerIndex = lines.findIndex((line) => line.trim() === marker);
-    if (markerIndex === -1) throw new Error(`marker not found in README.md: ${marker}`);
+/** The published inject-examples CLI, run through bunx (no local install). */
+const INJECT_EXAMPLES = '@hrg/inject-examples@1.0.0';
+
+/** The repository root, independent of the test runner's working directory. */
+const REPO = fileURLToPath(new URL('.', import.meta.url));
+
+/** The body of the fenced block that follows `markerLine` in `text`. */
+function blockAfter(text, markerLine) {
+    const lines = text.split('\n');
+    const markerIndex = lines.findIndex((line) => line.trim() === markerLine);
+    if (markerIndex === -1) throw new Error(`marker not found: ${markerLine}`);
 
     const open = lines.findIndex((line, i) => i > markerIndex && line.startsWith('```'));
-    if (open === -1) throw new Error(`no code block after ${marker}`);
+    if (open === -1) throw new Error(`no code block after ${markerLine}`);
 
     const close = lines.findIndex((line, i) => i > open && line.startsWith('```'));
-    if (close === -1) throw new Error(`unclosed code block after ${marker}`);
+    if (close === -1) throw new Error(`unclosed code block after ${markerLine}`);
 
     return lines.slice(open + 1, close).join('\n');
+}
+
+/** The body of the fenced block that follows `marker` in README.md. */
+function readmeBlock(marker) {
+    return blockAfter(README, marker);
+}
+
+/** Run the inject-examples CLI with `args` in `cwd`, capturing everything. */
+function invokeInjector(args, cwd) {
+    let code = 0;
+    let stdout = '';
+    let stderr = '';
+    try {
+        stdout = execFileSync('bunx', [INJECT_EXAMPLES, ...args], { cwd, encoding: 'utf8' });
+    } catch (err) {
+        code = typeof err.status === 'number' ? err.status : 1;
+        stdout = err.stdout ? String(err.stdout) : '';
+        stderr = err.stderr ? String(err.stderr) : '';
+    }
+    return { code, stdout, stderr };
+}
+
+/**
+ * Run the inject-examples CLI in a throwaway directory holding `files`
+ * (name to text), on `doc.md`. `args` are passed before the file name; the
+ * directory is removed afterwards.
+ */
+function runInjectorInTemp(files, args = []) {
+    const dir = mkdtempSync(join(tmpdir(), 'inject-examples-'));
+    const document = join(dir, 'doc.md');
+    try {
+        for (const [name, text] of Object.entries(files)) {
+            writeFileSync(join(dir, name), text, 'utf8');
+        }
+        const result = invokeInjector([...args, 'doc.md'], dir);
+        return { ...result, document };
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 }
 
 /** Character index of every unescaped `|` in a line. */
@@ -334,6 +375,19 @@ describe('parseArgs', () => {
 });
 
 describe('region directives', () => {
+    /** A document with one region marker and an empty block, over `source` as source.txt. */
+    function regionFiles(source, region) {
+        return {
+            'source.txt': source,
+            'doc.md': `[source.txt](./source.txt#region:${region})\n\n\`\`\`markdown\n\n\`\`\``,
+        };
+    }
+
+    /** The block the CLI wrote after the marker in the updated document. */
+    function injectedBlock(result, region) {
+        return blockAfter(readFileSync(result.document, 'utf8'), `[source.txt](./source.txt#region:${region})`);
+    }
+
     test('accepts the spelling of every editor that supports regions', () => {
         const spellings = [
             ['#region demo', '#endregion'],
@@ -347,17 +401,31 @@ describe('region directives', () => {
         ];
 
         for (const [start, end] of spellings) {
-            const source = [start, 'body', end].join('\n');
-            expect(regionDirective(start)).toEqual({ kind: 'region', name: 'demo' });
-            expect(extractRegion(source, 'demo')).toBe('body');
+            const result = runInjectorInTemp(regionFiles([start, 'body', end].join('\n'), 'demo'));
+            expect(result.code).toBe(0);
+            expect(injectedBlock(result, 'demo')).toBe('body');
         }
     });
 
     test('a markdown heading is prose, not a directive', () => {
-        expect(regionDirective('# Region of interest')).toBeNull();
-        expect(regionDirective('## Region')).toBeNull();
-        expect(regionDirective('region of interest')).toBeNull();
-        expect(regionDirective('#region of interest')).toEqual({ kind: 'region', name: 'of interest' });
+        // A heading that would claim a region name, if it were a directive, must
+        // not be read as one: naming that region fails with "no region found".
+        const prose = [
+            ['# Region of interest', 'of interest'],
+            ['## Region', 'Region'],
+            ['region of interest', 'of interest'],
+        ];
+
+        for (const [heading, name] of prose) {
+            const result = runInjectorInTemp(regionFiles(heading, name));
+            expect(result.code).toBe(1);
+            expect(result.stderr).toMatch(new RegExp(`no "#region ${name}" found`));
+        }
+
+        // The unambiguous C# spelling, by contrast, is a directive.
+        const result = runInjectorInTemp(regionFiles(['#region of interest', 'body', '#endregion'].join('\n'), 'of interest'));
+        expect(result.code).toBe(0);
+        expect(injectedBlock(result, 'of interest')).toBe('body');
     });
 
     test('picks the region by name and ignores the others', () => {
@@ -370,81 +438,113 @@ describe('region directives', () => {
             '#endregion',
         ].join('\n');
 
-        expect(extractRegion(source, 'one')).toBe('first');
-        expect(extractRegion(source, 'two')).toBe('second');
+        const one = runInjectorInTemp(regionFiles(source, 'one'));
+        expect(one.code).toBe(0);
+        expect(injectedBlock(one, 'one')).toBe('first');
+
+        const two = runInjectorInTemp(regionFiles(source, 'two'));
+        expect(two.code).toBe(0);
+        expect(injectedBlock(two, 'two')).toBe('second');
     });
 
     test('keeps the body byte for byte, indentation included', () => {
         const source = ['#region demo', '  indented  ', '', 'last', '#endregion'].join('\n');
-        expect(extractRegion(source, 'demo')).toBe('  indented  \n\nlast');
+        const result = runInjectorInTemp(regionFiles(source, 'demo'));
+        expect(result.code).toBe(0);
+        expect(injectedBlock(result, 'demo')).toBe('  indented  \n\nlast');
     });
 
     test('a missing region is an error', () => {
-        const source = ['#region demo', 'body', '#endregion'].join('\n');
-        expect(() => extractRegion(source, 'nope')).toThrow(/no "#region nope" found/);
+        const result = runInjectorInTemp(regionFiles(['#region demo', 'body', '#endregion'].join('\n'), 'nope'));
+        expect(result.code).toBe(1);
+        expect(result.stderr).toMatch(/no "#region nope" found/);
     });
 
     test('a duplicated region name is an error', () => {
         const source = ['#region demo', 'a', '#endregion', '#region demo', 'b', '#endregion'].join('\n');
-        expect(() => extractRegion(source, 'demo')).toThrow(/appears 2 times/);
+        const result = runInjectorInTemp(regionFiles(source, 'demo'));
+        expect(result.code).toBe(1);
+        expect(result.stderr).toMatch(/appears 2 times/);
     });
 
     test('an unterminated region is an error', () => {
-        const source = ['#region demo', 'a'].join('\n');
-        expect(() => extractRegion(source, 'demo')).toThrow(/never closed/);
+        const result = runInjectorInTemp(regionFiles(['#region demo', 'a'].join('\n'), 'demo'));
+        expect(result.code).toBe(1);
+        expect(result.stderr).toMatch(/never closed/);
     });
 });
 
 describe('markers', () => {
     const wholeFile = '[fixtures/example-1/before.md](./fixtures/example-1/before.md)';
-    const regionFile = '[fixtures/example-4/source.md](./fixtures/example-4/source.md#region:table)';
+
+    /** A document holding just `marker` and an empty block, plus any extra files. */
+    function markerFiles(marker, extraFiles = {}) {
+        return {
+            ...extraFiles,
+            'doc.md': `${marker}\n\n\`\`\`markdown\n\n\`\`\``,
+        };
+    }
 
     test('reads a whole-file marker', () => {
-        expect(parseMarker(wholeFile)).toEqual({
-            raw: wholeFile,
-            path: 'fixtures/example-1/before.md',
-            region: null,
-        });
+        const result = runInjectorInTemp(markerFiles(wholeFile), ['--root', REPO]);
+        expect(result.code).toBe(0);
+        expect(blockAfter(readFileSync(result.document, 'utf8'), wholeFile)).toBe(EXAMPLES[0].before);
     });
 
     test('reads a region marker', () => {
-        expect(parseMarker(regionFile)).toEqual({
-            raw: regionFile,
-            path: 'fixtures/example-4/source.md',
-            region: 'table',
-        });
+        const marker = '[source.txt](./source.txt#region:table)';
+        const result = runInjectorInTemp(markerFiles(marker, {
+            'source.txt': ['#region table', '| A | B |', '#endregion'].join('\n'),
+        }));
+        expect(result.code).toBe(0);
+        expect(blockAfter(readFileSync(result.document, 'utf8'), marker)).toBe('| A | B |');
     });
 
     test('ignores lines that are not a bare link', () => {
-        expect(parseMarker('see [the docs](https://example.com) first')).toBeNull();
-        expect(parseMarker('')).toBeNull();
-        expect(parseMarker('```markdown')).toBeNull();
+        const lines = [
+            'see [the docs](https://example.com) first',
+            '',
+            '```markdown',
+        ];
+
+        for (const line of lines) {
+            const result = runInjectorInTemp({ 'doc.md': line }, ['--check', '--allow-empty']);
+            expect(result.code).toBe(0);
+            expect(result.stdout).toMatch(/no markers, nothing to do/);
+        }
     });
 
     test('ignores a link whose label is not its own path', () => {
-        expect(parseMarker('[the docs](https://example.com)')).toBeNull();
-        expect(parseMarker('[before.md](./fixtures/example-1/before.md)')).toBeNull();
+        const lines = [
+            '[the docs](https://example.com)',
+            '[before.md](./fixtures/example-1/before.md)',
+        ];
+
+        for (const line of lines) {
+            const result = runInjectorInTemp({ 'doc.md': line }, ['--check', '--allow-empty']);
+            expect(result.code).toBe(0);
+            expect(result.stdout).toMatch(/no markers, nothing to do/);
+        }
     });
 
     test('ignores an ordinary anchor fragment', () => {
-        expect(parseMarker('[fixtures/example-1/before.md](./fixtures/example-1/before.md#section)')).toBeNull();
+        const line = '[fixtures/example-1/before.md](./fixtures/example-1/before.md#section)';
+        const result = runInjectorInTemp({ 'doc.md': line }, ['--check', '--allow-empty']);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toMatch(/no markers, nothing to do/);
     });
 
     test('resolves the region a marker names', () => {
-        const marker = parseMarker(markerFor('example-4', 'before'));
-        const example = EXAMPLES.find((candidate) => candidate.id === 'example-4');
-
-        expect(marker.region).toBe('table');
-        expect(resolveMarker(marker)).toBe(example.before);
+        const marker = markerFor('example-4', 'before');
+        const result = runInjectorInTemp(markerFiles(marker), ['--root', REPO]);
+        expect(result.code).toBe(0);
+        expect(blockAfter(readFileSync(result.document, 'utf8'), marker)).toBe(readmeBlock(marker));
     });
 
     test('every marker in README.md resolves to the block below it', () => {
-        const markers = findMarkers(README.split('\n'));
-
-        expect(markers.length).toBe(EXAMPLES.length * 2);
-        for (const marker of markers) {
-            expect(readmeBlock(marker.raw)).toBe(resolveMarker(marker));
-        }
+        const result = invokeInjector(['--check', '--no-gitignore', 'README.md'], REPO);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toMatch(new RegExp(`matches all ${EXAMPLES.length * 2} marker\\(s\\)`));
     });
 
     test('example-4 takes its before from a region, not a whole file', () => {

@@ -4,14 +4,11 @@
   "description": "A small utility to fix tables in markdown files",
   "main": "md-fix-tables.js",
   "type": "module",
-  "dependencies": {
-    "@hrg/inject-examples": "^1.0.0"
-  },
   "scripts": {
     "start": "node md-fix-tables.js",
     "test": "bun test",
-    "inject:examples": "node tools/inject-examples.mjs",
-    "check:examples": "node tools/inject-examples.mjs --check"
+    "inject:examples": "bunx @hrg/inject-examples@1.0.0",
+    "check:examples": "bunx @hrg/inject-examples@1.0.0 --check"
   },
   "keywords": ["markdown", "tables", "fix"],
   "author": "",

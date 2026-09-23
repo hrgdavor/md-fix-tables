@@ -338,9 +338,9 @@ there is only room for the colon plus two dashes, so a column that narrow gets
 ## Development
 
 ```bash
-bun test                                 # run the test suite
-node tools/inject-examples.mjs           # copy fixtures/ into README.md
-node tools/inject-examples.mjs --check   # exit 1 if README.md is stale
+bun test                                  # run the test suite
+npm run inject:examples                   # copy fixtures/ into README.md
+npm run check:examples                    # exit 1 if README.md is stale
 ```
 
 Each example lives in its own folder under `fixtures/`, as two real files:

@@ -8,9 +8,10 @@
  *     fixtures/example-1/after.md    byte-for-byte what fixTables(before) returns
  *
  * A `before.md` is deliberately ragged — do not run md-fix-tables.js over one.
- * The inject-examples tool (see inject-examples/) copies both into README.md
- * after the link that names them, so the README cannot drift from them, and
- * test-fix-tables.test.js fails if the tool stops agreeing with any `after`.
+ * The published `@hrg/inject-examples` tool (run through bunx, see package.json)
+ * copies both into README.md after the link that names them, so the README
+ * cannot drift from them, and test-fix-tables.test.js fails if the tool stops
+ * agreeing with any `after`.
  *
  * A side of an example can also come from one *region* of a larger file, so a
  * README block can show part of a document instead of the whole thing. Mark the
@@ -29,15 +30,6 @@
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
-import {
-    extractRegion,
-    findMarkers,
-    normalize,
-    parseMarker,
-    regionDirective,
-} from './inject-examples/index.mjs';
-
-export { extractRegion, findMarkers, parseMarker, regionDirective };
 
 const ROOT = new URL('.', import.meta.url);
 const WHICH = ['before', 'after'];
@@ -64,10 +56,23 @@ function readRepoFile(relativePath) {
     return readFileSync(new URL(relativePath, ROOT), 'utf8');
 }
 
-/** The text a marker stands for: a whole file, or one region of one. */
-export function resolveMarker(marker) {
-    const text = readRepoFile(marker.path);
-    return marker.region ? extractRegion(text, marker.region) : normalize(text);
+/** LF endings, no trailing newline: the text a block should hold. */
+function normalize(text) {
+    return text.replace(/\r\n/g, '\n').replace(/\n$/, '');
+}
+
+/**
+ * The lines of the named `#region` block in a fixture source. Fixture loading
+ * only: the full region grammar (every spelling, every error) is what the
+ * CLI-based tests in test-fix-tables.test.js verify against the published tool.
+ */
+function regionOf(text, name) {
+    const lines = text.replace(/\r\n/g, '\n').split('\n');
+    const start = lines.findIndex((line) => line.includes(`#region ${name}`));
+    if (start === -1) throw new Error(`no "#region ${name}" in fixture source`);
+    const end = lines.findIndex((line, i) => i > start && line.includes('#endregion'));
+    if (end === -1) throw new Error(`"#region ${name}" is never closed`);
+    return lines.slice(start + 1, end).join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +103,7 @@ export function markerFor(id, which) {
 export function fixtureContent(id, which) {
     const { region } = sourceFor(id, which);
     const text = readRepoFile(fixturePath(id, which));
-    return region ? extractRegion(text, region) : normalize(text);
+    return normalize(region ? regionOf(text, region) : text);
 }
 
 export const EXAMPLES = IDS.map((id) => ({
