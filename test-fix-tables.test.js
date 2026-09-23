@@ -67,18 +67,19 @@ function invokeInjector(args, cwd) {
 
 /**
  * Run the inject-examples CLI in a throwaway directory holding `files`
- * (name to text), on `doc.md`. `args` are passed before the file name; the
- * directory is removed afterwards.
+ * (name to text), on `doc.md`. `args` are passed before the file name.
+ * Returns { code, stdout, stderr, document }, where `document` is the final
+ * content of doc.md, read before the directory is removed.
  */
 function runInjectorInTemp(files, args = []) {
     const dir = mkdtempSync(join(tmpdir(), 'inject-examples-'));
-    const document = join(dir, 'doc.md');
+    const documentPath = join(dir, 'doc.md');
     try {
         for (const [name, text] of Object.entries(files)) {
             writeFileSync(join(dir, name), text, 'utf8');
         }
         const result = invokeInjector([...args, 'doc.md'], dir);
-        return { ...result, document };
+        return { ...result, document: readFileSync(documentPath, 'utf8') };
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
@@ -385,7 +386,7 @@ describe('region directives', () => {
 
     /** The block the CLI wrote after the marker in the updated document. */
     function injectedBlock(result, region) {
-        return blockAfter(readFileSync(result.document, 'utf8'), `[source.txt](./source.txt#region:${region})`);
+        return blockAfter(result.document, `[source.txt](./source.txt#region:${region})`);
     }
 
     test('accepts the spelling of every editor that supports regions', () => {
@@ -407,13 +408,16 @@ describe('region directives', () => {
         }
     });
 
-    test('a markdown heading is prose, not a directive', () => {
-        // A heading that would claim a region name, if it were a directive, must
-        // not be read as one: naming that region fails with "no region found".
+    test('a markdown heading or bare prose line is not a directive', () => {
+        // A line that looks like a region directive must not be read as one:
+        // without a comment prefix the C# `#region` spelling is required, and a
+        // space after the `#` already breaks it. Each line below contains the
+        // region name it would claim, yet naming that region fails.
         const prose = [
-            ['# Region of interest', 'of interest'],
+            ['# Region of interest', 'interest'],
             ['## Region', 'Region'],
-            ['region of interest', 'of interest'],
+            ['region of interest', 'interest'],
+            ['# region demo', 'demo'],
         ];
 
         for (const [heading, name] of prose) {
@@ -423,9 +427,9 @@ describe('region directives', () => {
         }
 
         // The unambiguous C# spelling, by contrast, is a directive.
-        const result = runInjectorInTemp(regionFiles(['#region of interest', 'body', '#endregion'].join('\n'), 'of interest'));
+        const result = runInjectorInTemp(regionFiles(['#region demo', 'body', '#endregion'].join('\n'), 'demo'));
         expect(result.code).toBe(0);
-        expect(injectedBlock(result, 'of interest')).toBe('body');
+        expect(injectedBlock(result, 'demo')).toBe('body');
     });
 
     test('picks the region by name and ignores the others', () => {
@@ -488,7 +492,7 @@ describe('markers', () => {
     test('reads a whole-file marker', () => {
         const result = runInjectorInTemp(markerFiles(wholeFile), ['--root', REPO]);
         expect(result.code).toBe(0);
-        expect(blockAfter(readFileSync(result.document, 'utf8'), wholeFile)).toBe(EXAMPLES[0].before);
+        expect(blockAfter(result.document, wholeFile)).toBe(EXAMPLES[0].before);
     });
 
     test('reads a region marker', () => {
@@ -497,7 +501,7 @@ describe('markers', () => {
             'source.txt': ['#region table', '| A | B |', '#endregion'].join('\n'),
         }));
         expect(result.code).toBe(0);
-        expect(blockAfter(readFileSync(result.document, 'utf8'), marker)).toBe('| A | B |');
+        expect(blockAfter(result.document, marker)).toBe('| A | B |');
     });
 
     test('ignores lines that are not a bare link', () => {
@@ -538,7 +542,7 @@ describe('markers', () => {
         const marker = markerFor('example-4', 'before');
         const result = runInjectorInTemp(markerFiles(marker), ['--root', REPO]);
         expect(result.code).toBe(0);
-        expect(blockAfter(readFileSync(result.document, 'utf8'), marker)).toBe(readmeBlock(marker));
+        expect(blockAfter(result.document, marker)).toBe(readmeBlock(marker));
     });
 
     test('every marker in README.md resolves to the block below it', () => {

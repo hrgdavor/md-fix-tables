@@ -1,9 +1,9 @@
 # Improvement plan
 
 Where the tool is now, and what to do next. Each item is written so it can be
-turned into a test directly — the fixture files under `fixtures/`, plus
-`tools/inject-examples.mjs`, mean a behaviour change can never leave the README
-telling a different story than the code.
+turned into a test directly — the fixture files under `fixtures/`, plus the
+published `@hrg/inject-examples` tool (run through bunx), mean a behaviour
+change can never leave the README telling a different story than the code.
 
 ## Done in this round
 

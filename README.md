@@ -343,6 +343,10 @@ npm run inject:examples                   # copy fixtures/ into README.md
 npm run check:examples                    # exit 1 if README.md is stale
 ```
 
+The `inject:examples` scripts run the published `@hrg/inject-examples` through
+`bunx`, version pinned in `package.json`; the first run fetches the package
+from the npm registry, later runs use the bun cache.
+
 Each example lives in its own folder under `fixtures/`, as two real files:
 `fixtures/example-1/before.md` and `fixtures/example-1/after.md`. A `before.md` is a
 table as written by hand; its `after.md` is byte-for-byte what `fixTables` returns
