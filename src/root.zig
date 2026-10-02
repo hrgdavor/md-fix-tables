@@ -19,6 +19,38 @@ pub const MAX_COL: usize = 100;
 /// The smallest legal markdown separator (`---`).
 pub const MIN_COL: usize = 3;
 
+/// The published version, printed by `-V` / `--version`. The JS tool reads it
+/// from `package.json`, so this literal and `build.zig.zon` must be bumped
+/// together with it; `test-fix-tables.test.js` asserts the three agree.
+pub const VERSION = "1.2.0";
+
+/// `md-fix-tables --help`, byte for byte the `HELP` string in
+/// `md-fix-tables.js`. The two have to be edited together.
+pub const HELP =
+    \\md-fix-tables — re-align every pipe table in a Markdown document
+    \\
+    \\Usage:
+    \\  md-fix-tables [options] [file]
+    \\
+    \\  With a file, its tables are rewritten in place and nothing is printed.
+    \\  Without one, stdin is read and the aligned document goes to stdout.
+    \\
+    \\Options:
+    \\  -m, --max-col <n>  cells at or over <n> characters neither set a column
+    \\                     width nor get padding (default 100, minimum 3);
+    \\                     --max-col=<n>, -m <n> and -m=<n> also work
+    \\  -c, --check        write nothing and exit 1 when the input is not
+    \\                     already aligned
+    \\  -h, --help         show this help
+    \\  -V, --version      show the version
+    \\
+    \\Exit codes:
+    \\  0  the tables were written, or --check found the input aligned
+    \\  1  a bad option, a file that cannot be read or written, or --check
+    \\     found the input unaligned
+    \\
+;
+
 /// Which way a separator cell points its column: `| :--- |` left, `| ---: |`
 /// right, `| :---: |` centre, `| --- |` unchanged.
 pub const Alignment = enum { none, left, right, center };
@@ -30,6 +62,12 @@ pub const ArgsResult = union(enum) {
         /// `null`, or an empty string (falsy in JS), selects stdin/stdout mode.
         file_path: ?[]const u8,
         max_col: usize,
+        /// `-c` / `--check`: report instead of writing.
+        check: bool,
+        /// `-h` / `--help` and `-V` / `--version` are recorded here and acted
+        /// on by the caller, which decides the precedence; `--help` wins.
+        help: bool,
+        version: bool,
     },
     err: []const u8,
 };
@@ -255,7 +293,101 @@ fn isTableLine(line: []const u8) bool {
     return trimmed.len > 0 and trimmed[0] == '|';
 }
 
+/// The leading run of spaces and tabs: the table's own indentation, which a row
+/// keeps so a table inside a list item stays inside it (JS `indentOf`).
+fn indentOf(line: []const u8) []const u8 {
+    for (line, 0..) |ch, i| {
+        if (ch != ' ' and ch != '\t') return line[0..i];
+    }
+    return line;
+}
+
+/// The column a list item's content starts at, or null when the line is not a
+/// list item (JS `listMarkerWidth`). `- x` puts its content at column 2, so a
+/// table indented four spaces under it sits at the item's own indentation 2 and
+/// is a table, not an indented code block. (Approximation: the marker plus one
+/// space, and tabs count as one column, which is enough for the documents this
+/// tool meets.)
+fn listMarkerWidth(line: []const u8) ?usize {
+    const i = indentOf(line).len;
+    if (i >= line.len) return null;
+    if (line[i] == '-' or line[i] == '*' or line[i] == '+') {
+        const j = i + 1;
+        if (j >= line.len or (line[j] != ' ' and line[j] != '\t')) return null;
+        return j + 1;
+    }
+    var k = i;
+    var digits: usize = 0;
+    while (k < line.len and digits < 9 and line[k] >= '0' and line[k] <= '9') : (k += 1) digits += 1;
+    if (digits == 0) return null;
+    if (k >= line.len or (line[k] != '.' and line[k] != ')')) return null;
+    const j = k + 1;
+    if (j >= line.len or (line[j] != ' ' and line[j] != '\t')) return null;
+    return j + 1;
+}
+
+/// A fenced code block marker: three or more backticks or tildes, indented or
+/// not, with the rest of the line after the run (JS `fenceMarker`). CommonMark: a
+/// backtick fence's info string may not contain a backtick, and a closing fence
+/// has nothing but spaces after it.
+const FenceMarker = struct { char: u8, len: usize, rest: []const u8 };
+
+fn fenceMarker(line: []const u8) ?FenceMarker {
+    var i: usize = indentOf(line).len;
+    if (i >= line.len) return null;
+    const ch = line[i];
+    if (ch != '`' and ch != '~') return null;
+    const start = i;
+    while (i < line.len and line[i] == ch) i += 1;
+    if (i - start < 3) return null;
+    return .{ .char = ch, .len = i - start, .rest = line[i..] };
+}
+
+/// CommonMark: a closing fence is the same character, at least as long, and
+/// followed by nothing but spaces (JS `isFenceClose`).
+fn isFenceClose(marker: ?FenceMarker, open: FenceMarker) bool {
+    const m = marker orelse return false;
+    return m.char == open.char and m.len >= open.len and jsTrim(m.rest).len == 0;
+}
+
+/// Everything between a fence and its closing marker is a code sample, never a
+/// table (JS `opensFence`). A code sample that happens to show a table — or that
+/// draws with `|`, or holds a Java `||` continuation — must survive a run
+/// untouched.
+fn opensFence(marker: ?FenceMarker) bool {
+    const m = marker orelse return false;
+    return m.char == '~' or std.mem.indexOfScalar(u8, m.rest, '`') == null;
+}
+
 const Row = []const []const u8;
+
+/// One line of a table block: the text without its `\r`, and whether it had one.
+const TableRow = struct { body: []const u8, cr: bool };
+
+/// The line as it arrived: its body, and its `\r` if it had one (JS builds the
+/// same string when it re-joins a block it did not align).
+fn verbatimLine(arena: Allocator, row: TableRow) Allocator.Error![]const u8 {
+    if (!row.cr) return row.body;
+    const out = try arena.alloc(u8, row.body.len + 1);
+    @memcpy(out[0..row.body.len], row.body);
+    out[row.body.len] = '\r';
+    return out;
+}
+
+/// How many columns the table has (JS `columnCount`). GFM: the header row and
+/// the delimiter row declare them, and a row with more cells than that has its
+/// excess *ignored* by the renderer — so the table is never widened to fit such a
+/// row, which is what used to turn one unescaped `|` inside a cell into an extra
+/// column for the whole table. A block whose row 2 is no delimiter row has only
+/// its widest row to go on.
+fn columnCount(table_data: []const Row) usize {
+    if (table_data.len >= 2 and isSeparatorRow(table_data[1], 1)) {
+        return @max(table_data[0].len, table_data[1].len);
+    }
+    var num_cols: usize = 0;
+    for (table_data) |cells| num_cols = @max(num_cols, cells.len);
+    return num_cols;
+}
 
 /// Split a row into trimmed cells. `\|` is an escaped pipe: it stays literal
 /// and does not split the cell. A leading/trailing empty cell is the row's
@@ -342,12 +474,15 @@ fn appendSeparatorCell(
 /// regenerated at each measured column width, keeping whatever alignment
 /// (`:---`, `---:`, `:---:`) they declared; the colons stay inside the cell,
 /// so every pipe still lands on the same index as the rows around it.
-fn alignTable(alloc: Allocator, rows: []const []const u8, max_col: usize) Allocator.Error![]u8 {
+///
+/// Each row is emitted at the block's own indentation and with its own line
+/// ending, so a table keeps its place in a document and a CRLF file stays CRLF.
+fn alignTable(alloc: Allocator, rows: []const TableRow, max_col: usize) Allocator.Error![]u8 {
     const table_data = try alloc.alloc(Row, rows.len);
-    for (rows, 0..) |line, r| table_data[r] = try parseRow(alloc, line);
+    for (rows, 0..) |row, r| table_data[r] = try parseRow(alloc, row.body);
 
-    var num_cols: usize = 0;
-    for (table_data) |cells| num_cols = @max(num_cols, cells.len);
+    const num_cols = columnCount(table_data);
+    const indent = indentOf(rows[0].body);
 
     // The alignment row, for the columns it covers. A block whose row 2 is
     // not a separator row has no alignment to keep.
@@ -364,12 +499,16 @@ fn alignTable(alloc: Allocator, rows: []const []const u8, max_col: usize) Alloca
     // shorter cell to pad out to it. Row 2 is measured along with every other
     // row even though it is regenerated: counting the whole cell is what makes
     // the rebuilt separator exactly as wide as the one it replaces.
+    //
+    // Cells past `num_cols` are not measured at all: they are outside the table
+    // the header declared, and the renderer does not show them.
     const col_widths = try alloc.alloc(usize, num_cols);
     const longest_cell = try alloc.alloc(usize, num_cols);
     @memset(col_widths, 0);
     @memset(longest_cell, 0);
     for (table_data) |cells| {
         for (cells, 0..) |cell, i| {
+            if (i >= num_cols) break;
             const l = jsLen(cell);
             if (l > longest_cell[i]) longest_cell[i] = l;
             if (l < max_col and l > col_widths[i]) col_widths[i] = l;
@@ -397,6 +536,8 @@ fn alignTable(alloc: Allocator, rows: []const []const u8, max_col: usize) Alloca
     var out: std.ArrayList(u8) = .empty;
     for (table_data, 0..) |cells, row_index| {
         if (row_index > 0) try out.append(alloc, '\n');
+        try out.appendSlice(alloc, indent);
+
         if (isSeparatorRow(cells, row_index)) {
             try out.appendSlice(alloc, "| ");
             for (col_widths, 0..) |w, i| {
@@ -404,35 +545,69 @@ fn alignTable(alloc: Allocator, rows: []const []const u8, max_col: usize) Alloca
                 try appendSeparatorCell(&out, alloc, alignments[i], w);
             }
             try out.appendSlice(alloc, " |");
-            continue;
+        } else {
+            // Rule 2: a cell may only pad as far as its own boundary. Once an
+            // earlier oversized cell has pushed the row right, the remaining
+            // padding is shrunk — and dropped entirely if the boundary is
+            // already behind us — so the padding never carries this row
+            // further into the next column's space.
+            var pos: i64 = 2;
+            try out.appendSlice(alloc, "| ");
+            for (0..num_cols) |i| {
+                if (i > 0) try out.appendSlice(alloc, " | ");
+                const cell: []const u8 = if (i < cells.len) cells[i] else "";
+                const cell_len: i64 = @as(i64, @intCast(jsLen(cell)));
+                const len: i64 = @max(cell_len, ideal_end[i] - pos);
+                try out.appendSlice(alloc, cell);
+                if (len > cell_len) {
+                    try out.appendNTimes(alloc, ' ', @as(usize, @intCast(len - cell_len)));
+                }
+                pos += len + 3;
+            }
+            // Cells past the declared columns are kept verbatim rather than
+            // dropped: a renderer ignores them, and this tool never truncates a
+            // line.
+            if (cells.len > num_cols) {
+                for (cells[num_cols..]) |cell| {
+                    try out.appendSlice(alloc, " | ");
+                    try out.appendSlice(alloc, cell);
+                }
+            }
+            try out.appendSlice(alloc, " |");
         }
 
-        // Rule 2: a cell may only pad as far as its own boundary. Once an
-        // earlier oversized cell has pushed the row right, the remaining
-        // padding is shrunk — and dropped entirely if the boundary is already
-        // behind us — so the padding never carries this row further into the
-        // next column's space.
-        var pos: i64 = 2;
-        try out.appendSlice(alloc, "| ");
-        for (0..num_cols) |i| {
-            if (i > 0) try out.appendSlice(alloc, " | ");
-            const cell: []const u8 = if (i < cells.len) cells[i] else "";
-            const cell_len: i64 = @as(i64, @intCast(jsLen(cell)));
-            const len: i64 = @max(cell_len, ideal_end[i] - pos);
-            try out.appendSlice(alloc, cell);
-            if (len > cell_len) {
-                try out.appendNTimes(alloc, ' ', @as(usize, @intCast(len - cell_len)));
-            }
-            pos += len + 3;
-        }
-        try out.appendSlice(alloc, " |");
+        if (rows[row_index].cr) try out.append(alloc, '\r');
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// A block of one line is not a table: `|` alone on a line is prose, art, or the
+/// tail of something else, and re-emitting it as `|  |` was the tool inventing a
+/// table where the document had none (JS `flush`).
+fn flushTable(
+    arena: Allocator,
+    pieces: *std.ArrayList([]const u8),
+    table: *std.ArrayList(TableRow),
+    max_col: usize,
+) Allocator.Error!void {
+    if (table.items.len >= 2) {
+        try pieces.append(arena, try alignTable(arena, table.items, max_col));
+    } else {
+        for (table.items) |row| try pieces.append(arena, try verbatimLine(arena, row));
+    }
+    table.clearRetainingCapacity();
 }
 
 /// Re-align every pipe table in markdown text (JS `fixTables`). `max_col` is
 /// the width at/above which a cell stops counting towards its column's width
 /// (the JS default is `MAX_COL`, 100).
+///
+/// Lines are split on `\n` and a trailing `\r` is kept per line, so a CRLF
+/// document stays CRLF. Three things are never a table, and each is copied
+/// verbatim: a fenced code block, an indented code block (a run of lines at four
+/// spaces or more, measured from whatever list item contains them, that begins
+/// after a blank line), and a line that starts with `|` but is not part of a block
+/// of at least two such lines.
 pub fn fixTables(alloc: Allocator, content: []const u8, max_col: usize) Allocator.Error![]u8 {
     // All scratch lives in an arena so callers only own the returned slice.
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -440,23 +615,84 @@ pub fn fixTables(alloc: Allocator, content: []const u8, max_col: usize) Allocato
     const arena = scratch.allocator();
 
     const lines = try splitLines(arena, content);
+    const rows = try arena.alloc(TableRow, lines.len);
+    for (lines, 0..) |line, i| {
+        rows[i] = if (line.len > 0 and line[line.len - 1] == '\r')
+            .{ .body = line[0 .. line.len - 1], .cr = true }
+        else
+            .{ .body = line, .cr = false };
+    }
 
     var pieces: std.ArrayList([]const u8) = .empty;
-    var table: std.ArrayList([]const u8) = .empty;
-    for (lines) |line| {
-        if (isTableLine(line)) {
-            try table.append(arena, line);
-        } else {
-            if (table.items.len > 0) {
-                try pieces.append(arena, try alignTable(arena, table.items, max_col));
-                table.clearRetainingCapacity();
-            }
-            try pieces.append(arena, line);
+    var table: std.ArrayList(TableRow) = .empty;
+    var open: ?FenceMarker = null; // the open fence marker while inside a code block
+    var indented_code = false; // inside a run of indented code
+    var container: usize = 0; // the column the enclosing list item's content starts at
+    var after_blank = true; // the start of a document is a blank line for this purpose
+
+    for (rows) |row| {
+        const marker = fenceMarker(row.body);
+
+        if (open != null) {
+            if (isFenceClose(marker, open.?)) open = null;
+            try flushTable(arena, &pieces, &table, max_col);
+            try pieces.append(arena, try verbatimLine(arena, row));
+            after_blank = false;
+            continue;
         }
+        if (opensFence(marker)) {
+            try flushTable(arena, &pieces, &table, max_col);
+            open = marker;
+            try pieces.append(arena, try verbatimLine(arena, row));
+            after_blank = false;
+            continue;
+        }
+
+        // A blank line ends a table, and keeps an indented code block open (the
+        // block ends at the next line that is indented less than four).
+        if (jsTrim(row.body).len == 0) {
+            try flushTable(arena, &pieces, &table, max_col);
+            try pieces.append(arena, try verbatimLine(arena, row));
+            after_blank = true;
+            continue;
+        }
+
+        // An indented code block: four columns past whatever contains it, and only
+        // where a paragraph could not be continuing — CommonMark's rule, which is
+        // what "after a blank line" stands in for here.
+        const indent = indentOf(row.body).len;
+        if (indented_code) {
+            if (indent >= container + 4) {
+                try flushTable(arena, &pieces, &table, max_col);
+                try pieces.append(arena, try verbatimLine(arena, row));
+                after_blank = false;
+                continue;
+            }
+            indented_code = false;
+        }
+        if (indent >= container + 4 and after_blank) {
+            indented_code = true;
+            try flushTable(arena, &pieces, &table, max_col);
+            try pieces.append(arena, try verbatimLine(arena, row));
+            after_blank = false;
+            continue;
+        }
+
+        if (listMarkerWidth(row.body)) |width| {
+            container = width;
+        } else if (indent == 0) {
+            container = 0;
+        }
+
+        after_blank = false;
+        if (isTableLine(row.body)) {
+            try table.append(arena, row);
+            continue;
+        }
+        try flushTable(arena, &pieces, &table, max_col);
+        try pieces.append(arena, try verbatimLine(arena, row));
     }
-    if (table.items.len > 0) {
-        try pieces.append(arena, try alignTable(arena, table.items, max_col));
-    }
+    try flushTable(arena, &pieces, &table, max_col);
 
     const out = try joinLines(arena, pieces.items);
     return alloc.dupe(u8, out);
@@ -467,8 +703,9 @@ pub fn fixTables(alloc: Allocator, content: []const u8, max_col: usize) Allocato
 // ---------------------------------------------------------------------------
 
 /// Parse the command line (JS `parseArgs`). Accepts a single file path plus an
-/// optional width, in every spelling the JS tool accepts:
+/// optional width and the flags, in every spelling the JS tool accepts:
 ///
+///   -c  --check    -h  --help    -V  --version
 ///   --max-col=<n>   --max-col <n>   -m <n>   -m=<n>
 ///
 /// `argv` is the user arguments only (node's `process.argv.slice(2)`), and the
@@ -476,11 +713,27 @@ pub fn fixTables(alloc: Allocator, content: []const u8, max_col: usize) Allocato
 pub fn parseArgs(alloc: Allocator, argv: []const []const u8) Allocator.Error!ArgsResult {
     var max_col: usize = MAX_COL;
     var file_path: ?[]const u8 = null;
+    var check = false;
+    var help = false;
+    var version = false;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         var value: ?[]const u8 = null;
+
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--check")) {
+            check = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            version = true;
+            continue;
+        }
 
         if (std.mem.startsWith(u8, arg, "--max-col=")) {
             value = arg["--max-col=".len..];
@@ -508,7 +761,13 @@ pub fn parseArgs(alloc: Allocator, argv: []const []const u8) Allocator.Error!Arg
         max_col = @intCast(parsed.?);
     }
 
-    return .{ .ok = .{ .file_path = file_path, .max_col = max_col } };
+    return .{ .ok = .{
+        .file_path = file_path,
+        .max_col = max_col,
+        .check = check,
+        .help = help,
+        .version = version,
+    } };
 }
 
 // ---------------------------------------------------------------------------
@@ -967,15 +1226,162 @@ test "astral-plane cells pad in UTF-16 units like JS" {
     );
 }
 
-test "CRLF table rows come back LF-only, surrounding lines keep their CR" {
+test "CRLF table rows keep their CR, like every other line" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    // Each line keeps the ending it arrived with: a formatter must not turn the
+    // rows of a CRLF document into LF and leave the rest of the file CRLF.
     const before = "prose\r\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\ntail\r\n";
     try testing.expectEqualStrings(
-        "prose\r\n| a   | b   |\n| --- | --- |\n| 1   | 2   |\ntail\r\n",
+        "prose\r\n| a   | b   |\r\n| --- | --- |\r\n| 1   | 2   |\r\ntail\r\n",
         try fixed(alloc, before, MAX_COL),
+    );
+
+    // Mixed endings stay mixed: a row is re-emitted with its own, not its
+    // neighbours'.
+    const mixed = "| a | b |\r\n| --- | --- |\n| 1 | 2 |\r\n";
+    try testing.expectEqualStrings(
+        "| a   | b   |\r\n| --- | --- |\n| 1   | 2   |\r\n",
+        try fixed(alloc, mixed, MAX_COL),
+    );
+}
+
+test "a fenced code block is never a table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A code sample showing a table, and a diagram drawn with pipes, and a Java
+    // `||` continuation: all three came back rewritten before this.
+    const sample = "before:\n\n```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
+    try testing.expectEqualStrings(sample, try fixed(alloc, sample, MAX_COL));
+
+    const diagram = "flow:\n\n~~~\nstart\n   |\n   v\nend\n~~~\n";
+    try testing.expectEqualStrings(diagram, try fixed(alloc, diagram, MAX_COL));
+
+    const java = "```java\nassertTrue(a.contains(\"x\")\n        || b.contains(\"y\"));\n```\n";
+    try testing.expectEqualStrings(java, try fixed(alloc, java, MAX_COL));
+
+    // A fence closes only on its own character, at least as long: a longer run
+    // of tildes inside a backtick fence is content.
+    const nested = "```\n| a | b |\n~~~\n| c | d |\n```\n";
+    try testing.expectEqualStrings(nested, try fixed(alloc, nested, MAX_COL));
+
+    // An unclosed fence swallows the rest of the document.
+    const unclosed = "```\n| a | b |\n| --- | --- |\n";
+    try testing.expectEqualStrings(unclosed, try fixed(alloc, unclosed, MAX_COL));
+
+    // ...and a table *around* a fence is still aligned on both sides.
+    const around = "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```\n| x | y |\n```\n\n| c | d |\n| --- | --- |\n";
+    try testing.expectEqualStrings(
+        "| a   | b   |\n| --- | --- |\n| 1   | 2   |\n\n```\n| x | y |\n```\n\n| c   | d   |\n| --- | --- |\n",
+        try fixed(alloc, around, MAX_COL),
+    );
+}
+
+test "a row keeps its own indentation, so a table stays inside its list item" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const nested = "- item\n\n  | A | B |\n  | --- | --- |\n  | 1 | 2 |\n";
+    try testing.expectEqualStrings(
+        "- item\n\n  | A   | B   |\n  | --- | --- |\n  | 1   | 2   |\n",
+        try fixed(alloc, nested, MAX_COL),
+    );
+
+    // The block's indentation is the first row's; a ragged row follows it.
+    const ragged = "\t| A | B |\n\t| --- | --- |\n| 1 | 2 |\n";
+    try testing.expectEqualStrings(
+        "\t| A   | B   |\n\t| --- | --- |\n\t| 1   | 2   |\n",
+        try fixed(alloc, ragged, MAX_COL),
+    );
+}
+
+test "a row with more cells than the header never widens the table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The unescaped pipe in the code span splits that cell (GFM does the same),
+    // and the renderer ignores the excess cell — so the header keeps its three
+    // columns and the extra cell is left where it is, unpadded, not dropped.
+    const before = "| A | B | C |\n| --- | --- | --- |\n| code | `x | y` | note |\n";
+    try testing.expectEqualStrings(
+        "| A    | B   | C   |\n| ---- | --- | --- |\n| code | `x  | y`  | note |\n",
+        try fixed(alloc, before, MAX_COL),
+    );
+
+    // Fewer cells than the header is the documented other half: appended empty.
+    const fewer = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 |\n";
+    try testing.expectEqualStrings(
+        "| A   | B   | C   |\n| --- | --- | --- |\n| 1   | 2   |     |\n",
+        try fixed(alloc, fewer, MAX_COL),
+    );
+}
+
+test "a lone pipe line is not a table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A block of one line is prose, art, or the tail of something else. It used
+    // to come back as `|  |`.
+    try testing.expectEqualStrings("text\n\n   |\n\nmore text\n", try fixed(alloc, "text\n\n   |\n\nmore text\n", MAX_COL));
+    try testing.expectEqualStrings("|", try fixed(alloc, "|", MAX_COL));
+}
+
+test "an indented code block is never a table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Four spaces after a blank line is CommonMark's indented code block, and a
+    // code sample that shows a table must come through byte for byte.
+    const block = "text\n\n    | A | B |\n    | --- | --- |\n    | 1 | 2 |\n";
+    try testing.expectEqualStrings(block, try fixed(alloc, block, MAX_COL));
+
+    // It runs to the first line indented less than four, blank lines inside it
+    // included.
+    const open = "text\n\n    | A | B |\n\n    | --- | --- |\ntail\n";
+    try testing.expectEqualStrings(open, try fixed(alloc, open, MAX_COL));
+
+    // At the very start of a document, with no blank line before it.
+    const first = "    | A | B |\n    | --- | --- |\n";
+    try testing.expectEqualStrings(first, try fixed(alloc, first, MAX_COL));
+
+    // A line indented four spaces with no blank line before it is a paragraph
+    // continuation, not code - an indented code block cannot interrupt one.
+    const after_text = "text\n    | A | B |\n    | --- | --- |\n";
+    const fixed_after_text = try fixed(alloc, after_text, MAX_COL);
+    try testing.expect(!std.mem.eql(u8, after_text, fixed_after_text));
+}
+
+test "a table indented inside a list item is still a table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `- ` puts the item's content at column 2, so four spaces is the item's own
+    // indentation 2 - a table, and it keeps its place in the item.
+    const nested = "- item\n\n    | A | B |\n    | --- | --- |\n    | 1 | 2 |\n";
+    try testing.expectEqualStrings(
+        "- item\n\n    | A   | B   |\n    | --- | --- |\n    | 1   | 2   |\n",
+        try fixed(alloc, nested, MAX_COL),
+    );
+
+    // Six spaces under `- ` is four past the item's content, so that one *is* an
+    // indented code block inside the item.
+    const code = "- item\n\n      | A | B |\n      | --- | --- |\n";
+    try testing.expectEqualStrings(code, try fixed(alloc, code, MAX_COL));
+
+    // An ordered marker is wider, so its content starts at column 3.
+    const ordered = "1. item\n\n   | A | B |\n   | --- | --- |\n";
+    try testing.expectEqualStrings(
+        "1. item\n\n   | A   | B   |\n   | --- | --- |\n",
+        try fixed(alloc, ordered, MAX_COL),
     );
 }
 
@@ -986,7 +1392,7 @@ test "fixTables on empty and separator-only input" {
 
     try testing.expectEqualStrings("", try fixed(alloc, "", MAX_COL));
     try testing.expectEqualStrings("\n", try fixed(alloc, "\n", MAX_COL));
-    try testing.expectEqualStrings("|  |", try fixed(alloc, "|", MAX_COL));
+    try testing.expectEqualStrings("|", try fixed(alloc, "|", MAX_COL));
     try testing.expectEqualStrings("a", try fixed(alloc, "a", MAX_COL));
 }
 
@@ -1039,6 +1445,19 @@ fn expectOk(alloc: Allocator, argv: []const []const u8, file_path: ?[]const u8, 
     try testing.expect(result == .ok);
     try testing.expectEqualStrings(file_path orelse "", result.ok.file_path orelse "");
     try testing.expectEqual(max_col, result.ok.max_col);
+    // No flag is set unless a test says so through `expectFlags`.
+    try testing.expect(!result.ok.check and !result.ok.help and !result.ok.version);
+}
+
+/// The `-c`, `-h` and `-V` flags of a parse, with no file path and MAX_COL.
+fn expectFlags(alloc: Allocator, argv: []const []const u8, check: bool, help: bool, version: bool) !void {
+    const result = try parseArgs(alloc, argv);
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok.file_path == null);
+    try testing.expectEqual(MAX_COL, result.ok.max_col);
+    try testing.expectEqual(check, result.ok.check);
+    try testing.expectEqual(help, result.ok.help);
+    try testing.expectEqual(version, result.ok.version);
 }
 
 fn expectErr(alloc: Allocator, argv: []const []const u8, message: []const u8) !void {
@@ -1093,4 +1512,49 @@ test "parseArgs: rejects bad values and unknown options" {
     try expectErr(alloc, &.{"--max-col"}, "--max-col needs an integer >= 3, got: undefined");
     try expectErr(alloc, &.{"--nope"}, "Unknown option: --nope");
     try expectErr(alloc, &.{"-"}, "Unknown option: -");
+}
+
+test "parseArgs: accepts -c, -h and -V in both spellings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try expectFlags(alloc, &.{"-c"}, true, false, false);
+    try expectFlags(alloc, &.{"--check"}, true, false, false);
+    try expectFlags(alloc, &.{"-h"}, false, true, false);
+    try expectFlags(alloc, &.{"--help"}, false, true, false);
+    try expectFlags(alloc, &.{"-V"}, false, false, true);
+    try expectFlags(alloc, &.{"--version"}, false, false, true);
+}
+
+test "parseArgs: flags combine with a file path and a width" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try parseArgs(alloc, &.{ "--check", "--max-col=25", "notes.md" });
+    try testing.expect(result == .ok);
+    try testing.expectEqualStrings("notes.md", result.ok.file_path.?);
+    try testing.expectEqual(@as(usize, 25), result.ok.max_col);
+    try testing.expect(result.ok.check and !result.ok.help and !result.ok.version);
+
+    // Repeats and order do not matter, and all three can be set at once: the
+    // caller resolves help before version before the work itself.
+    try expectFlags(alloc, &.{ "-c", "-c" }, true, false, false);
+    try expectFlags(alloc, &.{ "-V", "--help" }, false, true, true);
+    try expectErr(alloc, &.{ "--help", "--nope" }, "Unknown option: --nope");
+    try expectErr(alloc, &.{ "-c", "--max-col=2" }, "--max-col needs an integer >= 3, got: 2");
+
+    // A flag after the file path belongs to the same command line.
+    const flag_last = try parseArgs(alloc, &.{ "notes.md", "-c" });
+    try testing.expect(flag_last == .ok);
+    try testing.expectEqualStrings("notes.md", flag_last.ok.file_path.?);
+    try testing.expect(flag_last.ok.check);
+}
+
+test "VERSION and HELP are non-empty and end in a newline" {
+    try testing.expect(VERSION.len > 0);
+    try testing.expect(HELP.len > 0);
+    try testing.expectEqual(@as(u8, '\n'), HELP[HELP.len - 1]);
+    try testing.expect(std.mem.startsWith(u8, HELP, "md-fix-tables — re-align"));
+    try testing.expect(std.mem.endsWith(u8, HELP, "found the input unaligned\n"));
 }

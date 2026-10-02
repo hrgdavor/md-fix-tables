@@ -1,3 +1,17 @@
+#!/usr/bin/env node
+
+/**
+ * md-fix-tables — re-align every pipe table in a Markdown document.
+ *
+ * One file, two roles. Imported, it is a library: `fixTables`, `parseArgs` and
+ * the constants. Run (the `md-fix-tables` bin), it is the CLI documented in
+ * `HELP` below — a file is rewritten in place, or stdin is aligned to stdout,
+ * with `--check` reporting instead of writing.
+ *
+ * `src/root.zig` is a byte-for-byte port of this file: when the two disagree,
+ * this one is right, and `tools/compare-zig.mjs` is what proves they do not.
+ */
+
 import { readFileSync, writeFileSync } from 'fs';
 import { pathToFileURL } from 'url';
 
@@ -7,10 +21,76 @@ export const MIN_COL = 3; // smallest legal markdown separator
 
 export const SEP_CELL = /^:?-{3,}:?$/;
 
+/** The name `--check` reports for the stdin/stdout mode. */
+const STDIN_NAME = '<stdin>';
+
+/**
+ * `md-fix-tables --help`. The Zig port prints these same bytes, so the two
+ * implementations have to be edited together.
+ */
+export const HELP = `md-fix-tables — re-align every pipe table in a Markdown document
+
+Usage:
+  md-fix-tables [options] [file]
+
+  With a file, its tables are rewritten in place and nothing is printed.
+  Without one, stdin is read and the aligned document goes to stdout.
+
+Options:
+  -m, --max-col <n>  cells at or over <n> characters neither set a column
+                     width nor get padding (default 100, minimum 3);
+                     --max-col=<n>, -m <n> and -m=<n> also work
+  -c, --check        write nothing and exit 1 when the input is not
+                     already aligned
+  -h, --help         show this help
+  -V, --version      show the version
+
+Exit codes:
+  0  the tables were written, or --check found the input aligned
+  1  a bad option, a file that cannot be read or written, or --check
+     found the input unaligned
+`;
+
 // A line is part of a table when its first non-space character is a pipe.
 function isTableLine(line) {
   return line.trim().startsWith('|');
 }
+
+// The leading run of spaces and tabs: the table's own indentation, which a row
+// keeps so a table inside a list item stays inside it.
+function indentOf(line) {
+  return /^[ \t]*/.exec(line)[0];
+}
+
+// The column a list item's content starts at, or null when the line is not a
+// list item. `- x` puts its content at column 2, so a table indented four spaces
+// under it sits at the item's own indentation 2 and is a table, not an indented
+// code block. (Approximation: the marker plus one space, and tabs count as one
+// column, which is enough for the documents this tool meets.)
+function listMarkerWidth(line) {
+  const bullet = /^[ \t]*[-*+][ \t]/.exec(line);
+  if (bullet !== null) return bullet[0].length;
+  const ordered = /^[ \t]*\d{1,9}[.)][ \t]/.exec(line);
+  return ordered === null ? null : ordered[0].length;
+}
+
+// A fenced code block marker: three or more backticks or tildes, indented or
+// not, with the rest of the line after the run. CommonMark: a backtick fence's
+// info string may not contain a backtick, and a closing fence has nothing but
+// spaces after it.
+function fenceMarker(line) {
+  const m = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+  if (m === null) return null;
+  return { char: m[1][0], length: m[1].length, rest: m[2] };
+}
+
+const isFenceClose = (marker, open) =>
+  marker !== null && marker.char === open.char && marker.length >= open.length && marker.rest.trim() === '';
+
+// Everything between a fence and its closing marker is a code sample, never a
+// table. A code sample that happens to show a table — or that draws with `|`,
+// or holds a Java `||` continuation — must survive a run untouched.
+const opensFence = (marker) => marker !== null && (marker.char === '~' || !marker.rest.includes('`'));
 
 // Split a row into trimmed cells. `\|` is an escaped pipe: it stays literal and
 // does not split the cell. A leading/trailing empty cell is the row's outer pipe.
@@ -67,13 +147,32 @@ function separatorCell(alignment, width) {
   return `${'-'.repeat(Math.max(width - 1, 2))}:`; // right
 }
 
+// How many columns the table has. GFM: the header row and the delimiter row
+// declare them, and a row with more cells than that has its excess *ignored* by
+// the renderer — so the table is never widened to fit such a row, which is what
+// used to turn one unescaped `|` inside a cell into an extra column for the
+// whole table. A block whose row 2 is no delimiter row has only its widest row
+// to go on.
+function columnCount(tableData) {
+  if (tableData.length >= 2 && isSeparatorRow(tableData[1], 1)) {
+    return Math.max(tableData[0].length, tableData[1].length);
+  }
+  return tableData.reduce((widest, row) => Math.max(widest, row.length), 0);
+}
+
 // Align a table block. Row 2's separator cells are regenerated at each measured
 // column width, keeping whatever alignment (`:---`, `---:`, `:---:`) they
 // declared; the colons stay inside the cell, so every pipe still lands on the
 // same index as the rows around it.
+//
+// `rows` are `{ body, cr }`: the line without its carriage return, and whether
+// it had one. Each row is emitted at the block's own indentation and with its
+// own line ending, so a table keeps its place in a document and a CRLF file
+// stays CRLF.
 function alignTable(rows, maxCol) {
-  const tableData = rows.map(parseRow);
-  const numCols = Math.max(...tableData.map(r => r.length));
+  const tableData = rows.map(r => parseRow(r.body));
+  const numCols = columnCount(tableData);
+  const indent = indentOf(rows[0].body);
 
   // The alignment row, for the columns it covers. A block whose row 2 is not a
   // separator row has no alignment to keep.
@@ -89,11 +188,15 @@ function alignTable(rows, maxCol) {
   // its colons are the only content that takes up room without being text, and
   // counting the whole cell is what makes the rebuilt separator exactly as wide
   // as the one it replaces.
+  //
+  // Cells past `numCols` are not measured at all: they are outside the table the
+  // header declared, and the renderer does not show them.
   const colWidths = Array(numCols).fill(0);
   const longestCell = Array(numCols).fill(0);
 
   tableData.forEach(row => {
     row.forEach((cell, i) => {
+      if (i >= numCols) return;
       if (cell.length > longestCell[i]) longestCell[i] = cell.length;
       if (cell.length < maxCol && cell.length > colWidths[i]) {
         colWidths[i] = cell.length;
@@ -122,9 +225,9 @@ function alignTable(rows, maxCol) {
   // oversized cell has pushed the row right, the remaining padding is shrunk —
   // and dropped entirely if the boundary is already behind us — so the padding
   // never carries this row further into the next column's space.
-  return tableData.map((row, rowIndex) => {
+  const bodies = tableData.map((row, rowIndex) => {
     if (isSeparatorRow(row, rowIndex)) {
-      return `| ${colWidths.map((w, i) => separatorCell(alignments[i], w)).join(' | ')} |`;
+      return indent + `| ${colWidths.map((w, i) => separatorCell(alignments[i], w)).join(' | ')} |`;
     }
 
     const cells = [];
@@ -135,8 +238,13 @@ function alignTable(rows, maxCol) {
       cells.push(len > cell.length ? cell.padEnd(len) : cell);
       pos += len + 3;
     }
-    return `| ${cells.join(' | ')} |`;
-  }).join('\n');
+    // Cells past the declared columns are kept verbatim rather than dropped: a
+    // renderer ignores them, and this tool never truncates a line.
+    const extra = row.length > numCols ? ` | ${row.slice(numCols).join(' | ')} |` : ' |';
+    return indent + `| ${cells.join(' | ')}${extra}`;
+  });
+
+  return bodies.map((body, i) => body + (rows[i].cr ? '\r' : '')).join('\n');
 }
 
 /**
@@ -144,38 +252,144 @@ function alignTable(rows, maxCol) {
  *
  * `maxCol` is the width at/above which a cell stops counting towards its
  * column's width (default MAX_COL, 100).
+ *
+ * Lines are split on `\n` and a trailing `\r` is kept per line, so a CRLF
+ * document stays CRLF: a table row comes back with the ending it arrived with,
+ * not the one the other rows happen to use. Three things are never a table, and
+ * each is copied verbatim: a fenced code block, an indented code block (a run of
+ * lines at four spaces or more, measured from whatever list item contains them,
+ * that begins after a blank line), and a line that starts with `|` but is not part
+ * of a block of at least two such lines (a lone `|` in prose, say).
  */
 export function fixTables(content, maxCol = MAX_COL) {
-  const lines = content.split('\n');
-  let result = [], currentTable = [];
+  const lines = content.split('\n').map(line => (
+    line.endsWith('\r') ? { body: line.slice(0, -1), cr: true } : { body: line, cr: false }
+  ));
+
+  const result = []; // whole lines, each already carrying its own `\r` if it had one
+  let table = [];
+  let fence = null; // the open fence marker while inside a code block
+  let indentedCode = false; // inside a run of indented code
+  let container = 0; // the column the enclosing list item's content starts at
+  let afterBlank = true; // the start of a document is a blank line for this purpose
+
+  const verbatim = (line) => line.body + (line.cr ? '\r' : '');
+
+  // A block of one line is not a table: `|` alone on a line is prose, art, or
+  // the tail of something else, and re-emitting it as `|  |` was the tool
+  // inventing a table where the document had none.
+  const flush = () => {
+    if (table.length >= 2) {
+      // `alignTable` emits the rows with their own line endings.
+      result.push(alignTable(table, maxCol));
+    } else {
+      for (const row of table) result.push(verbatim(row));
+    }
+    table = [];
+  };
 
   for (const line of lines) {
-    if (isTableLine(line)) {
-      currentTable.push(line);
-    } else {
-      if (currentTable.length > 0) {
-        result.push(alignTable(currentTable, maxCol));
-        currentTable = [];
-      }
-      result.push(line);
+    const marker = fenceMarker(line.body);
+
+    if (fence !== null) {
+      if (isFenceClose(marker, fence)) fence = null;
+      flush();
+      result.push(verbatim(line));
+      afterBlank = false;
+      continue;
     }
+    if (opensFence(marker)) {
+      flush();
+      fence = marker;
+      result.push(verbatim(line));
+      afterBlank = false;
+      continue;
+    }
+
+    // A blank line ends a table, and keeps an indented code block open (the
+    // block ends at the next line that is indented less than four).
+    if (line.body.trim() === '') {
+      flush();
+      result.push(verbatim(line));
+      afterBlank = true;
+      continue;
+    }
+
+    // An indented code block: four columns past whatever contains it, and only
+    // where a paragraph could not be continuing — CommonMark's rule, which is
+    // what "after a blank line" stands in for here.
+    const indent = indentOf(line.body).length;
+    if (indentedCode) {
+      if (indent >= container + 4) {
+        flush();
+        result.push(verbatim(line));
+        afterBlank = false;
+        continue;
+      }
+      indentedCode = false;
+    }
+    if (indent >= container + 4 && afterBlank) {
+      indentedCode = true;
+      flush();
+      result.push(verbatim(line));
+      afterBlank = false;
+      continue;
+    }
+
+    const markerWidth = listMarkerWidth(line.body);
+    if (markerWidth !== null) {
+      container = markerWidth;
+    } else if (indent === 0) {
+      container = 0;
+    }
+
+    afterBlank = false;
+    if (isTableLine(line.body)) {
+      table.push(line);
+      continue;
+    }
+    flush();
+    result.push(verbatim(line));
   }
-  if (currentTable.length > 0) result.push(alignTable(currentTable, maxCol));
+  flush();
+
   return result.join('\n');
 }
 
 /**
- * Parse the command line. Accepts a single file path plus an optional width:
+ * Parse the command line. Accepts a single file path plus the options:
  *
+ *   -c, --check                    -h, --help                    -V, --version
  *   --max-col=<n>   --max-col <n>   -m <n>   -m=<n>
+ *
+ * `--help` and `--version` are reported here rather than acted on, so the
+ * caller decides the precedence; like every other option they are still
+ * subject to the whole command line parsing, so a bad option anywhere is an
+ * error even beside `--help`.
  */
 export function parseArgs(argv) {
   let maxCol = MAX_COL;
   let filePath = null;
+  let check = false;
+  let help = false;
+  let version = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     let value = null;
+
+    if (arg === '-c' || arg === '--check') {
+      check = true;
+      continue;
+    }
+    if (arg === '-h' || arg === '--help') {
+      help = true;
+      continue;
+    }
+    if (arg === '-V' || arg === '--version') {
+      version = true;
+      continue;
+    }
 
     if (arg.startsWith('--max-col=')) {
       value = arg.slice('--max-col='.length);
@@ -197,7 +411,7 @@ export function parseArgs(argv) {
     maxCol = parsed;
   }
 
-  return { filePath, maxCol };
+  return { filePath, maxCol, check, help, version };
 }
 
 async function readStdin() {
@@ -211,6 +425,11 @@ function reportError(err) {
   process.exitCode = 1;
 }
 
+/** The published version, read from the package.json next to this file. */
+function version() {
+  return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8')).version;
+}
+
 // `import.meta.main` is Bun-only; under node, compare argv[1] with this file.
 function isMain() {
   if (typeof import.meta.main === 'boolean') return import.meta.main;
@@ -219,14 +438,30 @@ function isMain() {
 
 if (isMain()) {
   try {
-    const { filePath, maxCol } = parseArgs(process.argv.slice(2));
-    if (filePath) {
-      // File mode: rewrite in place and print nothing.
+    const { filePath, maxCol, check, help, version: showVersion } = parseArgs(process.argv.slice(2));
+
+    if (help) {
+      process.stdout.write(HELP);
+    } else if (showVersion) {
+      process.stdout.write(`${version()}\n`);
+    } else if (filePath) {
+      // File mode: rewrite in place and print nothing (--check only reports).
       const content = readFileSync(filePath, 'utf-8');
-      writeFileSync(filePath, fixTables(content, maxCol));
+      const fixed = fixTables(content, maxCol);
+      if (check) {
+        if (fixed !== content) throw new Error(`${filePath} is not aligned`);
+      } else {
+        writeFileSync(filePath, fixed);
+      }
     } else {
       // Stdin mode: read stdin and write the aligned result to stdout.
-      process.stdout.write(fixTables(await readStdin(), maxCol));
+      const content = await readStdin();
+      const fixed = fixTables(content, maxCol);
+      if (check) {
+        if (fixed !== content) throw new Error(`${STDIN_NAME} is not aligned`);
+      } else {
+        process.stdout.write(fixed);
+      }
     }
   } catch (err) {
     reportError(err);

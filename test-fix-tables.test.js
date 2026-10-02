@@ -14,12 +14,12 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fixTables, parseArgs, MAX_COL, MIN_COL } from './md-fix-tables.js';
+import { fixTables, parseArgs, MAX_COL, MIN_COL, HELP } from './md-fix-tables.js';
 import { EXAMPLE_MAX_COL, EXAMPLES, markerFor } from './test-fixtures.js';
 
 const README = readFileSync(new URL('./README.md', import.meta.url), 'utf8');
@@ -337,14 +337,115 @@ describe('fixTables', () => {
         expect(fixTables(before, 10).split('\n')[0]).toBe('| A   | B     |');
     });
 
+    test('a fenced code block is never a table', () => {
+        const untouched = [
+            // A code sample that shows a table.
+            'before:\n\n```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n',
+            // A diagram drawn with pipes.
+            'flow:\n\n~~~\nstart\n   |\n   v\nend\n~~~\n',
+            // A Java continuation line that starts with `||`.
+            '```java\nassertTrue(a.contains("x")\n        || b.contains("y"));\n```\n',
+            // A fence closes only on its own character, at least as long: a
+            // tilde run inside a backtick fence is content.
+            '```\n| a | b |\n~~~\n| c | d |\n```\n',
+            // An unclosed fence swallows the rest of the document.
+            '```\n| a | b |\n| --- | --- |\n',
+        ];
+        for (const input of untouched) expect(fixTables(input)).toBe(input);
+
+        // A table on either side of a fence is still aligned.
+        const around = '| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```\n| x | y |\n```\n\n| c | d |\n| --- | --- |\n';
+        expect(fixTables(around)).toBe(
+            '| a   | b   |\n| --- | --- |\n| 1   | 2   |\n\n```\n| x | y |\n```\n\n| c   | d   |\n| --- | --- |\n');
+    });
+
+    test('a table row keeps the line ending it arrived with', () => {
+        const before = 'prose\r\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\ntail\r\n';
+        expect(fixTables(before))
+            .toBe('prose\r\n| a   | b   |\r\n| --- | --- |\r\n| 1   | 2   |\r\ntail\r\n');
+
+        // Mixed endings stay mixed: a row is re-emitted with its own.
+        const mixed = '| a | b |\r\n| --- | --- |\n| 1 | 2 |\r\n';
+        expect(fixTables(mixed)).toBe('| a   | b   |\r\n| --- | --- |\n| 1   | 2   |\r\n');
+    });
+
+    test('an indented table keeps its indentation, so it stays in its list item', () => {
+        const nested = '- item\n\n  | A | B |\n  | --- | --- |\n  | 1 | 2 |\n';
+        expect(fixTables(nested)).toBe('- item\n\n  | A   | B   |\n  | --- | --- |\n  | 1   | 2   |\n');
+
+        // The block's indentation is the first row's; a ragged row follows it.
+        const ragged = '\t| A | B |\n\t| --- | --- |\n| 1 | 2 |\n';
+        expect(fixTables(ragged)).toBe('\t| A   | B   |\n\t| --- | --- |\n\t| 1   | 2   |\n');
+    });
+
+    test('a row with more cells than the header never widens the table', () => {
+        // The unescaped pipe in the code span splits that cell, exactly as GFM
+        // renders it — and a renderer ignores the excess cell, so the header
+        // keeps its three columns and the extra cell is kept where it is.
+        const before = '| A | B | C |\n| --- | --- | --- |\n| code | `x | y` | note |\n';
+        expect(fixTables(before))
+            .toBe('| A    | B   | C   |\n| ---- | --- | --- |\n| code | `x  | y`  | note |\n');
+
+        // Fewer cells than the header is the other half: appended empty.
+        const fewer = '| A | B | C |\n| --- | --- | --- |\n| 1 | 2 |\n';
+        expect(fixTables(fewer)).toBe('| A   | B   | C   |\n| --- | --- | --- |\n| 1   | 2   |     |\n');
+    });
+
+    test('a lone pipe line is not a table', () => {
+        expect(fixTables('text\n\n   |\n\nmore text\n')).toBe('text\n\n   |\n\nmore text\n');
+        expect(fixTables('|')).toBe('|');
+    });
+
+    test('an indented code block is never a table', () => {
+        // Four spaces after a blank line is CommonMark's indented code block, and
+        // a code sample that shows a table must come through byte for byte.
+        const block = 'text\n\n    | A | B |\n    | --- | --- |\n    | 1 | 2 |\n';
+        expect(fixTables(block)).toBe(block);
+
+        // It runs to the first line indented less than four, blank lines inside it
+        // included.
+        const open = 'text\n\n    | A | B |\n\n    | --- | --- |\ntail\n';
+        expect(fixTables(open)).toBe(open);
+
+        // At the very start of a document, with no blank line before it.
+        const first = '    | A | B |\n    | --- | --- |\n';
+        expect(fixTables(first)).toBe(first);
+
+        // A line indented four spaces with no blank line before it is a paragraph
+        // continuation, not code — an indented code block cannot interrupt one.
+        const afterText = 'text\n    | A | B |\n    | --- | --- |\n';
+        expect(fixTables(afterText)).not.toBe(afterText);
+    });
+
+    test('a table indented inside a list item is still a table', () => {
+        // `- ` puts the item's content at column 2, so four spaces is the item's
+        // own indentation 2 — a table, and it keeps its place in the item.
+        const nested = '- item\n\n    | A | B |\n    | --- | --- |\n    | 1 | 2 |\n';
+        expect(fixTables(nested))
+            .toBe('- item\n\n    | A   | B   |\n    | --- | --- |\n    | 1   | 2   |\n');
+
+        // Six spaces under `- ` is four past the item's content, so that one *is*
+        // an indented code block inside the item.
+        const code = '- item\n\n      | A | B |\n      | --- | --- |\n';
+        expect(fixTables(code)).toBe(code);
+
+        // An ordered marker is wider, so its content starts at column 3.
+        const ordered = '1. item\n\n   | A | B |\n   | --- | --- |\n';
+        expect(fixTables(ordered))
+            .toBe('1. item\n\n   | A   | B   |\n   | --- | --- |\n');
+    });
+
     test('MAX_COL is 100', () => {
         expect(MAX_COL).toBe(100);
     });
 });
 
 describe('parseArgs', () => {
+    /** The parse of an argument list with nothing set. */
+    const defaults = { filePath: null, maxCol: MAX_COL, check: false, help: false, version: false };
+
     test('defaults', () => {
-        expect(parseArgs([])).toEqual({ filePath: null, maxCol: MAX_COL });
+        expect(parseArgs([])).toEqual(defaults);
     });
 
     test('reads the file path', () => {
@@ -359,7 +460,38 @@ describe('parseArgs', () => {
     });
 
     test('keeps the file path and the option together', () => {
-        expect(parseArgs(['--max-col=50', 'notes.md'])).toEqual({ filePath: 'notes.md', maxCol: 50 });
+        expect(parseArgs(['--max-col=50', 'notes.md']))
+            .toEqual({ ...defaults, filePath: 'notes.md', maxCol: 50 });
+    });
+
+    test('accepts -c, -h and -V in both spellings', () => {
+        const spellings = [
+            [['-c'], 'check'],
+            [['--check'], 'check'],
+            [['-h'], 'help'],
+            [['--help'], 'help'],
+            [['-V'], 'version'],
+            [['--version'], 'version'],
+        ];
+
+        for (const [argv, field] of spellings) {
+            expect(parseArgs(argv)).toEqual({ ...defaults, [field]: true });
+        }
+    });
+
+    test('flags combine with a file path and a width, in any order', () => {
+        expect(parseArgs(['--check', '--max-col=25', 'notes.md']))
+            .toEqual({ ...defaults, filePath: 'notes.md', maxCol: 25, check: true });
+        expect(parseArgs(['notes.md', '-c']).check).toBe(true);
+        expect(parseArgs(['-c', '-c']).check).toBe(true);
+        expect(parseArgs(['-V', '--help'])).toEqual({ ...defaults, help: true, version: true });
+    });
+
+    test('a bad option is still an error beside --help', () => {
+        expect(() => parseArgs(['--help', '--nope'])).toThrow('Unknown option: --nope');
+        expect(() => parseArgs(['-C'])).toThrow('Unknown option: -C');
+        expect(() => parseArgs(['--check=true'])).toThrow('Unknown option: --check=true');
+        expect(() => parseArgs(['-c', '--max-col=2'])).toThrow();
     });
 
     test('rejects a max-col below MIN_COL', () => {
@@ -372,6 +504,125 @@ describe('parseArgs', () => {
 
     test('rejects an unknown option', () => {
         expect(() => parseArgs(['--nope'])).toThrow();
+    });
+});
+
+describe('cli', () => {
+    const CLI = fileURLToPath(new URL('./md-fix-tables.js', import.meta.url));
+    const PKG = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+
+    /** Run the CLI with `args` and `input` on stdin, from `cwd`. */
+    function cli(args, input = '', cwd = REPO) {
+        const result = spawnSync(process.execPath, [CLI, ...args], { cwd, input, encoding: 'utf8' });
+        return { code: result.status, stdout: result.stdout, stderr: result.stderr };
+    }
+
+    /** Write `content` (LF) as `name` in a fresh temp directory; return dir and path. */
+    function tempFile(name, content) {
+        const dir = mkdtempSync(join(tmpdir(), 'md-fix-tables-'));
+        const path = join(dir, name);
+        writeFileSync(path, content, 'utf8');
+        return { dir, path };
+    }
+
+    const RAGGED = '| a | b |\n| --- | --- |\n| 1 | 2 |\n';
+
+    test('--help prints the usage on stdout and exits 0', () => {
+        const result = cli(['--help']);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toBe(HELP);
+        expect(result.stderr).toBe('');
+        expect(cli(['-h']).stdout).toBe(HELP);
+    });
+
+    test('--version prints the published version and exits 0', () => {
+        expect(cli(['--version'])).toEqual({ code: 0, stdout: `${PKG.version}\n`, stderr: '' });
+        expect(cli(['-V']).stdout).toBe(`${PKG.version}\n`);
+    });
+
+    test('--help wins when both are given, and a file is ignored', () => {
+        expect(cli(['-V', '--help', 'notes.md']).stdout).toBe(HELP);
+    });
+
+    test('--check passes on aligned input and writes nothing', () => {
+        const aligned = fixTables(RAGGED);
+        expect(cli(['--check'], aligned)).toEqual({ code: 0, stdout: '', stderr: '' });
+        expect(cli(['-c', '--max-col=100'], aligned).code).toBe(0);
+
+        const { dir, path } = tempFile('table.md', aligned);
+        try {
+            expect(cli(['--check', path])).toEqual({ code: 0, stdout: '', stderr: '' });
+            expect(readFileSync(path, 'utf8')).toBe(aligned);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('--check fails on unaligned input, in both modes', () => {
+        const stdinResult = cli(['--check'], RAGGED);
+        expect(stdinResult.code).toBe(1);
+        expect(stdinResult.stdout).toBe('');
+        expect(stdinResult.stderr).toBe('Error: <stdin> is not aligned\n');
+
+        const { dir, path } = tempFile('table.md', RAGGED);
+        try {
+            const fileResult = cli(['--check', path]);
+            expect(fileResult.code).toBe(1);
+            expect(fileResult.stderr).toContain('is not aligned');
+            // The file is reported, never repaired.
+            expect(readFileSync(path, 'utf8')).toBe(RAGGED);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('--check obeys --max-col', () => {
+        // 30 characters: a column of its own at the default limit, ignored at 25.
+        const input = `| a | ${'x'.repeat(30)} |\n| --- | --- |\n| 1 | 2 |\n`;
+        const aligned = fixTables(input);
+
+        expect(cli(['--check'], aligned).code).toBe(0);
+        expect(cli(['--check', '--max-col=25'], aligned).code).toBe(1);
+        expect(cli(['--check', '--max-col=25'], fixTables(input, 25)).code).toBe(0);
+    });
+
+    test('--check reports a file it cannot read like any other run', () => {
+        const result = cli(['--check', 'no-such-file-here.md']);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toMatch(/^Error: ENOENT/);
+    });
+
+    test('a normal run still rewrites the file in place', () => {
+        const { dir, path } = tempFile('table.md', RAGGED);
+        try {
+            const result = cli([path]);
+            expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+            expect(readFileSync(path, 'utf8')).toBe(fixTables(RAGGED));
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('packaging', () => {
+    const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    const rootZig = readFileSync(new URL('./src/root.zig', import.meta.url), 'utf8');
+    const buildZon = readFileSync(new URL('./build.zig.zon', import.meta.url), 'utf8');
+
+    test('the JS, the Zig port and build.zig.zon agree on the version', () => {
+        // `--version` reads package.json on the JS side and the literal in
+        // root.zig on the Zig side, so a bump that misses one of these would
+        // make the two tools disagree.
+        expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
+        expect(rootZig).toContain(`pub const VERSION = "${pkg.version}"`);
+        expect(buildZon).toContain(`.version = "${pkg.version}"`);
+    });
+
+    test('the package publishes the CLI, the README and the LICENSE', () => {
+        expect(pkg.name).toBe('@hrg/md-fix-tables');
+        expect(pkg.bin).toEqual({ 'md-fix-tables': 'md-fix-tables.js' });
+        expect(pkg.files).toEqual(['md-fix-tables.js', 'README.md', 'LICENSE']);
+        expect(pkg.publishConfig).toEqual({ access: 'public' });
     });
 });
 

@@ -2,8 +2,11 @@
 //!
 //! File mode rewrites the file in place and prints nothing; with no file
 //! argument (or an empty one, which is falsy in JS) it reads stdin and writes
-//! the aligned result to stdout. Failures print `Error: <message>` on stderr
-//! and exit 1, with the same messages the JS tool produces.
+//! the aligned result to stdout. `--check` writes nothing and fails when the
+//! input is not already aligned; `--help` and `--version` print and exit 0,
+//! with `--help` winning when both are given. Failures print
+//! `Error: <message>` on stderr and exit 1, with the same messages the JS tool
+//! produces.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,14 +26,26 @@ pub fn main(init: std.process.Init) !void {
         .err => |message| reportError(io, message),
     };
 
+    // `--help` before `--version`, like the JS tool; both ignore the file.
+    if (parsed.help) return writeStdout(io, md_fix_tables.HELP);
+    if (parsed.version) return writeStdout(io, md_fix_tables.VERSION ++ "\n");
+
     if (parsed.file_path) |file_path| {
         if (file_path.len > 0) {
-            // File mode: rewrite in place and print nothing.
             const raw = md_fix_tables.readInputFile(io, alloc, file_path) catch |err| {
                 reportError(io, ioErrorMessage(alloc, io, file_path, err, .reading));
             };
             const content = try md_fix_tables.decodeUtf8(alloc, raw);
             const fixed = try md_fix_tables.fixTables(alloc, content, parsed.max_col);
+
+            if (parsed.check) {
+                if (!std.mem.eql(u8, content, fixed)) {
+                    reportError(io, fmt(alloc, "{s} is not aligned", .{file_path}));
+                }
+                return;
+            }
+
+            // File mode: rewrite in place and print nothing.
             Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = fixed }) catch |err| {
                 reportError(io, ioErrorMessage(alloc, io, file_path, err, .writing));
             };
@@ -45,10 +60,20 @@ pub fn main(init: std.process.Init) !void {
     const content = try md_fix_tables.decodeUtf8(alloc, raw);
     const fixed = try md_fix_tables.fixTables(alloc, content, parsed.max_col);
 
+    if (parsed.check) {
+        if (!std.mem.eql(u8, content, fixed)) reportError(io, "<stdin> is not aligned");
+        return;
+    }
+
+    try writeStdout(io, fixed);
+}
+
+/// The JS `process.stdout.write`: bytes to stdout, then a flush.
+fn writeStdout(io: Io, bytes: []const u8) !void {
     var stdout_buffer: [16 * 1024]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
-    try stdout.writeAll(fixed);
+    try stdout.writeAll(bytes);
     try stdout.flush();
 }
 

@@ -1,16 +1,51 @@
 {
-  "name": "md-fix-tables",
-  "version": "1.0.0",
-  "description": "A small utility to fix tables in markdown files",
-  "main": "md-fix-tables.js",
+  "name": "@hrg/md-fix-tables",
+  "version": "1.2.0",
+  "description": "Fix and align the pipe tables in a Markdown file: pad every cell to a single grid, rebuild the separator row, keep the alignment markers, close rows that never ended.",
+  "keywords": [
+    "markdown",
+    "tables",
+    "table",
+    "align",
+    "aligner",
+    "formatter",
+    "gfm",
+    "pipes",
+    "fix",
+    "readme",
+    "cli"
+  ],
+  "license": "MIT",
+  "author": "Davor Hrg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hrgdavor/md-fix-tables"
+  },
   "type": "module",
+  "sideEffects": false,
+  "main": "./md-fix-tables.js",
+  "exports": {
+    ".": "./md-fix-tables.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "md-fix-tables": "md-fix-tables.js"
+  },
+  "files": [
+    "md-fix-tables.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "start": "node md-fix-tables.js",
     "test": "bun test",
     "inject:examples": "bunx @hrg/inject-examples@1.0.0",
     "check:examples": "bunx @hrg/inject-examples@1.0.0 --check"
-  },
-  "keywords": ["markdown", "tables", "fix"],
-  "author": "",
-  "license": "MIT"
+  }
 }

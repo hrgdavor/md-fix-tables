@@ -6,9 +6,10 @@
  *
  * Everything is compared byte for byte: stdout, stderr, exit code, and (in
  * file mode) the rewritten file. The corpus is the repo itself, a battery of
- * synthetic edge cases, and two seeded fuzzers — one line-oriented (valid
- * UTF-8 markdown-ish tables) and one raw-byte (invalid UTF-8 included, which
- * exercises the WHATGWG replacement decoder both implementations use).
+ * synthetic edge cases, the CLI argument / `--check` / file-error paths, and
+ * two seeded fuzzers — one line-oriented (valid UTF-8 markdown-ish tables) and
+ * one raw-byte (invalid UTF-8 included, which exercises the WHATGWG
+ * replacement decoder both implementations use).
  *
  * Usage:  node tools/compare-zig.mjs [--seed N] [--rounds N]
  * Exit 0 when every comparison agrees, 1 otherwise.
@@ -85,13 +86,19 @@ function compareStdin(name, toolArgs, input) {
 /** Run both tools in file mode (in-place rewrite) and compare everything. */
 function compareFile(name, content, toolArgs = []) {
     checks += 1;
-    const jsFile = join(TMP, 'node', `${sanitize(name)}.md`);
-    const zigFile = join(TMP, 'zig', `${sanitize(name)}.md`);
-    writeFileSync(jsFile, content);
-    writeFileSync(zigFile, content);
+    // One shared path for both runs, so a message that names the file (a
+    // `--check` failure, an ENOENT) is comparable. The content is restored
+    // before the second run, and each tool's result is read out in between.
+    const file = join(TMP, 'shared', `${sanitize(name)}.md`);
+    writeFileSync(file, content);
 
-    const js = run('js', [...toolArgs, jsFile], Buffer.alloc(0));
-    const zig = run('zig', [...toolArgs, zigFile], Buffer.alloc(0));
+    const js = run('js', [...toolArgs, file], Buffer.alloc(0));
+    const jsOut = readFileSync(file);
+
+    writeFileSync(file, content);
+    const zig = run('zig', [...toolArgs, file], Buffer.alloc(0));
+    const zigOut = readFileSync(file);
+
     if (js.status !== zig.status) {
         fail(name, `file mode exit status ${js.status} (js) != ${zig.status} (zig)`);
     }
@@ -101,8 +108,6 @@ function compareFile(name, content, toolArgs = []) {
     if (!js.stderr.equals(zig.stderr)) {
         fail(name, `file mode stderr differs\n    js : ${show(js.stderr)}\n    zig: ${show(zig.stderr)}`);
     }
-    const jsOut = readFileSync(jsFile);
-    const zigOut = readFileSync(zigFile);
     if (!jsOut.equals(zigOut)) {
         fail(name, `rewritten file differs\n    js : ${show(jsOut)}\n    zig: ${show(zigOut)}`);
     }
@@ -120,8 +125,6 @@ function sanitize(name) {
 
 const TMP = join(ROOT, '.compare-tmp');
 rmSync(TMP, { recursive: true, force: true });
-mkdirSync(join(TMP, 'node'), { recursive: true });
-mkdirSync(join(TMP, 'zig'), { recursive: true });
 mkdirSync(join(TMP, 'shared'), { recursive: true });
 
 function repoFiles(dir = ROOT, out = []) {
@@ -268,10 +271,50 @@ const ARG_CASES = [
     ['--nope'],
     ['--max-col=5', '--max-col=9'],
     [''],
+    ['-c'],
+    ['--check'],
+    ['-h'],
+    ['--help'],
+    ['-V'],
+    ['--version'],
+    ['-c', '-c'],
+    ['-V', '--help'],
+    ['--help', '--nope'],
+    ['--check', '--max-col=2'],
+    ['--check', '--max-col=50'],
+    ['--check=true'],
+    ['-C'],
+    ['-v'],
+    ['--Check'],
+    ['--check', ''],
+    ['', '-c'],
+    ['-c', '-V'],
+    ['--check', '--help'],
+    ['--version', '--version'],
 ];
 
 for (const toolArgs of ARG_CASES) {
     compareStdin(`args: ${JSON.stringify(toolArgs)}`, toolArgs, TABLE_INPUT);
+}
+
+// `--check` in both input modes: nothing is written, and the exit code reports
+// whether the input was already aligned. `compareFile` also asserts that the
+// file on disk is left exactly as it was.
+console.log('— check cases —');
+const CHECK_CASES = [
+    ['aligned', Buffer.from('| a   | b   |\n| --- | --- |\n| 1   | 2   |\n', 'utf8')],
+    ['ragged', TABLE_INPUT],
+    ['no tables', Buffer.from('prose only\n', 'utf8')],
+    ['empty', Buffer.alloc(0)],
+    ['crlf', Buffer.from('| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\n', 'utf8')],
+    ['aligned m25', Buffer.from('| long name | b   |\n| --------- | --- |\n| 1         | 2   |\n', 'utf8')],
+];
+
+for (const [name, input] of CHECK_CASES) {
+    compareStdin(`check stdin: ${name}`, ['--check'], input);
+    compareStdin(`check stdin m25: ${name}`, ['--check', '--max-col=25'], input);
+    compareFile(`check file: ${name}`, input, ['--check']);
+    compareFile(`check file m25: ${name}`, input, ['--check', '--max-col=25']);
 }
 
 // File-path error behaviour (shared paths so messages are comparable).
@@ -282,6 +325,7 @@ compareStdin('missing absolute', [join(ROOT, 'nope-absolute-file.md')], TABLE_IN
 compareStdin('missing trailing slash', ['missing-trailing/'], TABLE_INPUT);
 compareStdin('directory read', [join(TMP, 'shared')], TABLE_INPUT);
 compareStdin('file then missing (last wins)', ['fixtures/example-1/after.md', 'missing-last.md'], TABLE_INPUT);
+compareStdin('check missing file', ['--check', 'missing-check.md'], TABLE_INPUT);
 
 // Two file paths: the last one wins and only it is rewritten.
 {
@@ -387,6 +431,7 @@ for (let i = 0; i < ROUNDS; i++) {
     if (i % 5 === 0) {
         const once = compareStdin(`fuzz table round2 #${i}`, toolArgs, buf);
         compareStdin(`fuzz table idem #${i}`, toolArgs, once); // both tools on their own output
+        compareStdin(`fuzz table check #${i}`, [...toolArgs, '--check'], once); // and it is aligned
         compareFile('fuzz file', buf, toolArgs);
     }
 }

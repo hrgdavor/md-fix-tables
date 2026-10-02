@@ -1,14 +1,36 @@
-# `md-fix-tables` — Markdown table aligner
+# `@hrg/md-fix-tables` — Markdown table aligner
 
+Rewrite the pipe tables in a Markdown file into one aligned grid: every cell is
+padded out to its column, the separator row is regenerated at the measured width,
+the alignment markers (`:---`, `---:`, `:---:`) are kept, and a row that was never
+closed gets its trailing pipe. Nothing is truncated or re-wrapped, fenced and
+indented code blocks are skipped whole, and every line that is not part of a table
+is copied verbatim — indentation and line ending included.
+
+No dependencies. Node 18+, or the Zig binary from the release page.
+
+## Install
+
+```bash
+npm install --save-dev @hrg/md-fix-tables
+```
+
+That puts a `md-fix-tables` command on `PATH`. To run it without installing:
+
+```bash
+npx @hrg/md-fix-tables input.md
+```
+
+## Usage
 
 ### Basic usage
 
 ```bash
 # Fix a file in place (no output)
-bun md-fix-tables.js input.md
+npx @hrg/md-fix-tables input.md
 
 # Using stdin/stdout for piping
-type input.md | bun md-fix-tables.js > output.md
+type input.md | npx @hrg/md-fix-tables > output.md
 ```
 
 ### Configurable max column width
@@ -18,20 +40,54 @@ measurement. The limit is the `MAX_COL` constant, and it can be overridden per r
 
 ```bash
 # Use a smaller threshold (50 chars) - overrides the 100 char default
-bun md-fix-tables.js --max-col=50 input.md
+npx @hrg/md-fix-tables --max-col=50 input.md
 
 # Or a larger one, which lets long cells set the column width again
-bun md-fix-tables.js --max-col=200 input.md
+npx @hrg/md-fix-tables --max-col=200 input.md
 
 # The space-separated form works too, as does the short flag
-bun md-fix-tables.js -m 200 input.md
+npx @hrg/md-fix-tables -m 200 input.md
 
 # Combine with stdin/stdout
-type input.md | bun md-fix-tables.js --max-col=75 > output.md
+type input.md | npx @hrg/md-fix-tables --max-col=75 > output.md
 ```
 
 `--max-col` must be an integer of at least 3 (the minimum legal separator);
 anything else exits 1 with a message on stderr.
+
+### Checking instead of writing
+
+`--check` (or `-c`) writes nothing and reports whether the document is already
+aligned, which is what a pre-commit hook or a CI step wants:
+
+```bash
+npx @hrg/md-fix-tables --check README.md    # exit 0 when aligned, 1 when not
+npx @hrg/md-fix-tables -c --max-col=25 README.md
+```
+
+An unaligned input is reported on stderr — `Error: README.md is not aligned` —
+and the file is left exactly as it was; in stdin mode the input is named
+`<stdin>`. A missing file is still an error, so `--check` never mistakes "could
+not read it" for "aligned".
+
+### Options
+
+In short — `--help` prints the same list with the exit codes and the longer
+descriptions:
+
+```text
+usage: md-fix-tables [options] [file]
+
+  -m, --max-col <n>  a cell at or over <n> characters neither sets a column
+                     width nor gets padding (default 100, minimum 3);
+                     --max-col=<n>, -m <n> and -m=<n> also work
+  -c, --check        write nothing and exit 1 when the input is not aligned
+  -h, --help         show the help
+  -V, --version      show the version
+```
+
+`--help` wins when it is given with `--version` or a file, but a bad option is
+still an error even beside `--help`.
 
 ---
 
@@ -295,24 +351,35 @@ there is only room for the colon plus two dashes, so a column that narrow gets
 * Regenerates row 2 as the separator row, at the measured width of each column.
 * Keeps the alignment row 2 declared: a `:---` cell is rebuilt as `:` plus dashes
   filling the column, a `:---:` one keeps both colons.
-* Rows with fewer cells than the widest row get empty cells appended.
+* Rows with fewer cells than the header row get empty cells appended.
 
 **Leaves alone**
 
 * Every line whose first non-space character is not `|` is copied verbatim — a
   table written *without* outer pipes (`A | B` on the first line) is not recognised
   at all and passes through untouched.
+* **Fenced code blocks, whole.** Everything between ` ``` ` or `~~~` and its closing
+  marker is a code sample, so one that shows a table, draws a diagram with `|`, or
+  holds a Java `||` continuation comes through byte for byte. A fence closes on its
+  own character repeated at least as many times as the opener; an unclosed fence
+  runs to the end of the document.
 * Cell content is never truncated or re-wrapped. Only whitespace padding is added
   or removed.
-* A line that already starts with `|` but is indented keeps its cells, but not its
-  indentation: the row is re-emitted from column 0. A 4-space-indented table inside
-  a Markdown code block is therefore rewritten as a table.
-* **Fenced code blocks are not recognised.** Pipe lines inside a fence are treated
-  as table rows, so a code sample containing a table is realigned — running this
-  tool on this README rewrites its own `Before` examples.
-* **Line endings are not preserved for table rows.** The document is split on `\n`
-  and rows are re-emitted without a trailing `\r`, so in a CRLF file the table rows
-  come back LF-only while the surrounding lines keep their CRLF.
+* **Each line keeps its own indentation and its own line ending.** A table indented
+  inside a list item stays inside it, and the rows of a CRLF document stay CRLF —
+  a document with mixed endings stays mixed, row by row, because a row is re-emitted
+  with the ending it arrived with.
+* A line that starts with `|` but is not part of a block of at least two such lines
+  is not a table: `|` alone on a line is prose, art, or the tail of something else,
+  and is copied verbatim.
+* **Indented code blocks, whole.** A run of lines at four spaces or more, measured from whatever list item
+  contains them and beginning after a blank line, is a code sample rather than a table. The measurement is
+  what keeps nested tables working: `- x` puts the item's content at column 2, so a table indented four
+  spaces under it sits at the item's own indentation 2 and **is** a table, while six spaces under it is a
+  code block inside the item. The marker counts as one column wide and a tab counts as one column, which is
+  an approximation that holds for ordinary documents. One consequence worth knowing: a line indented four
+  spaces with **no blank line before it** is a paragraph continuation, not code — an indented code block
+  cannot interrupt a paragraph — so such a line is treated as a table row like any other.
 
 ---
 
@@ -327,9 +394,15 @@ there is only room for the colon plus two dashes, so a column that narrow gets
 * **Row 2 is the separator row** (standard GFM) when every one of its cells matches
   `^:?-{3,}:?$`. A data row full of dashes in that position is therefore treated as
   the separator. If row 2 does *not* match, the block is still aligned, but no
-  separator is generated for it.
-* **A `|` inside a cell** (for example inside inline code) splits that cell. Write
-  `\|` to keep it literal — the backslash is preserved and the cell is not split.
+  separator is generated for it and the columns are the widest row's, since there is
+  no header pair to declare them.
+* **The header row and the separator row declare the columns** (GFM). A row with
+  more cells than that has its excess *ignored* by every renderer, so the table is
+  never widened to fit such a row: the excess cells stay in the row, unpadded and
+  never dropped, and the rest of the table stays as wide as the header says. A `|`
+  inside a cell — inside inline code, say — splits that cell, which is what GFM
+  renders; write `\|` to keep it literal instead. The backslash is preserved
+  verbatim and the cell is not split.
 * **Idempotent.** Re-running produces a byte-identical file: padding is trimmed
   before measuring, so widths and cursor positions are recomputed identically.
 
@@ -339,6 +412,7 @@ there is only room for the colon plus two dashes, so a column that narrow gets
 
 ```bash
 bun test                                  # run the test suite
+node md-fix-tables.js fixtures/example-1/after.md   # run the tool from a checkout
 npm run inject:examples                   # copy fixtures/ into README.md
 npm run check:examples                    # exit 1 if README.md is stale
 ```
@@ -386,6 +460,29 @@ Without a comment prefix the `#` must be attached, so a heading such as
 `# Region of interest` is prose and not a directive. Region names must be unique in
 a file, and an unterminated region is an error rather than a silent no-op.
 
+### Publishing
+
+`package.json` holds everything npm needs: the scoped name `@hrg/md-fix-tables`,
+`publishConfig.access: public` (a scoped package is private by default), the
+`md-fix-tables` bin, and a `files` whitelist, so a publish ships only
+`md-fix-tables.js`, this README and the LICENSE.
+
+```bash
+npm publish            # from a clean checkout, with the npm CLI logged in
+```
+
+`md-fix-tables.js` is both the library and the CLI: importing it exports
+`fixTables`, `parseArgs` and the constants, while running it as the `md-fix-tables`
+bin reads a file (or stdin) and rewrites the tables. The shebang and `bin` entry are
+what make the one file usable both ways. Bump `version` in `package.json` and tag
+`v<version>` so the GitHub release picks up the binaries.
+
+The version lives in three places — `package.json`, `pub const VERSION` in
+`src/root.zig` and `.version` in `build.zig.zon` — because the JS `--version` reads
+the package and the Zig one cannot. `test-fix-tables.test.js` asserts all three
+agree, and `node tools/compare-zig.mjs` compares the two tools' output, so a bump
+that misses one of them fails a test instead of shipping.
+
 ---
 
 ## The Zig port
@@ -402,9 +499,11 @@ zig build test                # the ported test suite (fixtures included)
 node tools/compare-zig.mjs    # differential harness: JS vs Zig, byte by byte
 ```
 
-The binary is a drop-in stand-in for `bun md-fix-tables.js`: same flags
-(`--max-col` in all four spellings), same stdin/stdout and rewrite-in-place
-modes, same `Error: …` messages on stderr and exit code 1 on failure.
+The binary is a drop-in stand-in for the JavaScript CLI (`node md-fix-tables.js`,
+or the published `md-fix-tables` command): same flags (`--max-col` in all four
+spellings, `-c`/`--check`, `-h`/`--help`, `-V`/`--version`), same stdin/stdout,
+rewrite-in-place and check modes, same `Error: …` messages on stderr and exit
+code 1 on failure, and the same `--help` text byte for byte.
 
 Tagging `v*` runs `.github/workflows/release.yml` (adapted from
 zig-watch-scp), which cross-builds `ReleaseSafe` binaries for x86_64 Linux,
@@ -414,11 +513,11 @@ release.
 Four JavaScript details decide byte equality, so the Zig code mirrors them
 exactly instead of approximating:
 
-| JS behaviour                              | how the Zig port mirrors it                                                     |
+| JS behaviour                              | how the Zig port mirrors it                                                    |
 | ----------------------------------------- | ------------------------------------------------------------------------------ |
 | `String.length` counts UTF-16 code units  | every width and padding count is a UTF-16 count, so an emoji pads one space    |
 | `String.trim`'s whitespace set            | the same NBSP/BOM/ogham/… set is trimmed, which is what makes `\u00a0\|` a row |
-| `Number.parseInt(x, 10)`                  | leading whitespace, one sign and trailing junk are all tolerated                |
+| `Number.parseInt(x, 10)`                  | leading whitespace, one sign and trailing junk are all tolerated               |
 | `readFileSync(path, 'utf-8')` decoding    | the WHATWG utf-8 decoder: each invalid maximal subpart becomes one U+FFFD      |
 
 The library side is importable as well: `fixTables`, `parseArgs`, `decodeUtf8`
